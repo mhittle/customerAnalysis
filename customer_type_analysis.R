@@ -5,7 +5,12 @@
 # =============================================================================
 
 # --- 1. Load Libraries -------------------------------------------------------
-library(tidyverse)
+# Load individual tidyverse packages to avoid the 'fs' dependency issue
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(tidyr)
 library(lubridate)
 library(scales)
 library(gridExtra)
