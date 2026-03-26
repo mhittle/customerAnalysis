@@ -18,9 +18,11 @@ library(gridExtra)
 # --- 2. Load Data ------------------------------------------------------------
 bc_orders <- read_csv("orders-2026-03-25.csv", show_col_types = FALSE)
 zoho_contacts <- read_csv("Contacts_2026_03_25.csv", show_col_types = FALSE)
+stripe_customers <- read_csv("stripe_unified_customers.csv", show_col_types = FALSE)
 
 cat("BigCommerce orders loaded:", nrow(bc_orders), "rows\n")
 cat("Zoho contacts loaded:", nrow(zoho_contacts), "rows\n")
+cat("Stripe customers loaded:", nrow(stripe_customers), "rows\n")
 
 # --- 3. Clean & Prep BigCommerce Orders --------------------------------------
 
@@ -229,6 +231,96 @@ orders_merged %>%
   count(display_class) %>%
   mutate(pct = round(n / sum(n) * 100, 1)) %>%
   print()
+
+# --- 6b. Integrate Stripe Data (Authoritative Payment Source) ----------------
+
+stripe_clean <- stripe_customers %>%
+  mutate(
+    stripe_email = tolower(trimws(Email)),
+    stripe_name = trimws(Name),
+    stripe_total_spend = as.numeric(gsub("[^0-9.]", "", `Total Spend`)),
+    stripe_payment_count = as.numeric(`Payment Count`),
+    stripe_avg_order = as.numeric(gsub("[^0-9.]", "", `Average Order`)),
+    stripe_refunded = as.numeric(gsub("[^0-9.]", "", `Refunded Volume`)),
+    stripe_created = ymd_hms(`Created (UTC)`, quiet = TRUE),
+    stripe_created_year = year(stripe_created)
+  ) %>%
+  filter(!is.na(stripe_email) & stripe_email != "")
+
+cat("\nStripe customers after cleaning:", nrow(stripe_clean), "\n")
+
+# Create Stripe lookup: one row per email (take highest spender if dupes)
+stripe_lookup <- stripe_clean %>%
+  group_by(stripe_email) %>%
+  summarise(
+    stripe_total_spend = sum(stripe_total_spend, na.rm = TRUE),
+    stripe_payment_count = sum(stripe_payment_count, na.rm = TRUE),
+    stripe_avg_order = mean(stripe_avg_order, na.rm = TRUE),
+    stripe_refunded = sum(stripe_refunded, na.rm = TRUE),
+    stripe_first_created = min(stripe_created, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge Stripe data onto classified orders
+orders_merged <- orders_merged %>%
+  left_join(stripe_lookup, by = c("match_email" = "stripe_email"))
+
+# --- Data Integrity: Compare BigCommerce vs Stripe coverage ---
+bc_emails <- orders_merged %>%
+  filter(!is.na(match_email)) %>%
+  distinct(match_email) %>%
+  pull()
+
+stripe_emails <- stripe_lookup %>% pull(stripe_email)
+
+bc_only <- setdiff(bc_emails, stripe_emails)
+stripe_only <- setdiff(stripe_emails, bc_emails)
+both <- intersect(bc_emails, stripe_emails)
+
+cat("\n--- Data Coverage: BigCommerce vs Stripe ---\n")
+cat(sprintf("  Customers in both:          %s\n", length(both)))
+cat(sprintf("  BigCommerce only:           %s\n", length(bc_only)))
+cat(sprintf("  Stripe only (not in BC):    %s\n", length(stripe_only)))
+cat(sprintf("  BigCommerce match rate:     %s%%\n",
+            round(length(both) / length(bc_emails) * 100, 1)))
+
+# Stripe-only customers with their classification from Zoho
+stripe_only_classified <- stripe_clean %>%
+  filter(stripe_email %in% stripe_only) %>%
+  left_join(
+    zoho_lookup %>% select(zoho_email, customer_class, classification_confidence),
+    by = c("stripe_email" = "zoho_email")
+  ) %>%
+  mutate(
+    final_class = ifelse(is.na(customer_class), "Unknown", customer_class),
+    broad_class = ifelse(final_class == "Professional", "Professional", "Residential")
+  )
+
+cat(sprintf("\n  Stripe-only total spend:    %s\n",
+            dollar(sum(stripe_only_classified$stripe_total_spend, na.rm = TRUE))))
+cat(sprintf("  Stripe-only total orders:   %s\n",
+            sum(stripe_only_classified$stripe_payment_count, na.rm = TRUE)))
+
+# Revenue comparison at customer level
+revenue_comparison <- orders_merged %>%
+  filter(!is.na(match_email) & !is.na(stripe_total_spend)) %>%
+  group_by(match_email) %>%
+  summarise(
+    bc_revenue = sum(order_total, na.rm = TRUE),
+    stripe_revenue = first(stripe_total_spend),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    customers = n(),
+    total_bc_revenue = sum(bc_revenue),
+    total_stripe_revenue = sum(stripe_revenue),
+    bc_capture_rate = round(total_bc_revenue / total_stripe_revenue * 100, 1)
+  )
+
+cat("\n--- Revenue Integrity Check (matched customers) ---\n")
+cat(sprintf("  BigCommerce revenue:        %s\n", dollar(revenue_comparison$total_bc_revenue)))
+cat(sprintf("  Stripe revenue:             %s\n", dollar(revenue_comparison$total_stripe_revenue)))
+cat(sprintf("  BC capture rate:            %s%%\n", revenue_comparison$bc_capture_rate))
 
 # --- 7. Analysis by Customer Type & Year -------------------------------------
 
@@ -497,8 +589,13 @@ orders_export <- orders_merged %>%
     pro_signal_count, classification_confidence,
     # Zoho signals
     zoho_customer_type, zoho_business_type, zoho_trade_status,
-    starts_with("sig_")
+    starts_with("sig_"),
+    # Stripe data
+    stripe_total_spend, stripe_payment_count, stripe_avg_order, stripe_refunded
   )
+
+# Export Stripe-only customers (not in BigCommerce) for review
+write_csv(stripe_only_classified, "stripe_only_customers.csv")
 
 write_csv(orders_export, "orders_classified.csv")
 
@@ -549,4 +646,15 @@ for (i in 1:nrow(repeat_summary)) {
               repeat_summary$avg_orders_per_customer[i],
               dollar(repeat_summary$avg_ltv[i])))
 }
+
+cat("\nStripe Payment Integrity:\n")
+stripe_total_rev <- sum(stripe_lookup$stripe_total_spend, na.rm = TRUE)
+stripe_total_orders <- sum(stripe_lookup$stripe_payment_count, na.rm = TRUE)
+cat(sprintf("  Total Stripe revenue (all time): %s\n", dollar(stripe_total_rev)))
+cat(sprintf("  Total Stripe transactions:       %s\n", comma(stripe_total_orders)))
+cat(sprintf("  Stripe customers:                %s\n", comma(nrow(stripe_lookup))))
+cat(sprintf("  Stripe-only (not in BC export):  %s customers, %s revenue\n",
+            comma(length(stripe_only)),
+            dollar(sum(stripe_only_classified$stripe_total_spend, na.rm = TRUE))))
+cat(sprintf("  BC capture rate vs Stripe:       %s%%\n", revenue_comparison$bc_capture_rate))
 cat("\n=============================================================\n")
