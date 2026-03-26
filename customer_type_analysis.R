@@ -60,9 +60,20 @@ zoho_clean <- zoho_contacts %>%
     zoho_lead_source = tolower(trimws(`Lead Source`)),
     zoho_trade_status = tolower(trimws(`Trade Program Status`)),
     zoho_trade_interest = tolower(trimws(`Trade Program Interest`)),
+    zoho_trade_program = tolower(trimws(`Trade Program`)),
     zoho_professional_type = tolower(trimws(ifelse(
       "professionalType" %in% names(.), `professionalType`, NA_character_
     ))),
+    zoho_customer_type_meta = tolower(trimws(ifelse(
+      "customerType" %in% names(.), `customerType`, NA_character_
+    ))),
+    zoho_trade_interest_meta = tolower(trimws(ifelse(
+      "tradeProgramInterest" %in% names(.), `tradeProgramInterest`, NA_character_
+    ))),
+    zoho_pro_project_type = tolower(trimws(ifelse(
+      "proProjectType" %in% names(.), `proProjectType`, NA_character_
+    ))),
+    zoho_projects_per_year = tolower(trimws(`Projects per Year`)),
     zoho_business_id = trimws(`Business ID`),
     zoho_business_entity = trimws(`Business Entity`),
     zoho_tax_exempt = tolower(trimws(`Tax Exempt?`)),
@@ -111,11 +122,27 @@ zoho_classified <- zoho_clean %>%
     sig_trade_interest = !is.na(zoho_trade_interest) & zoho_trade_interest != "" &
       zoho_trade_interest != "no" & zoho_trade_interest != "none" &
       zoho_trade_interest != "n/a",
+    # Trade Program boolean field (true/false)
+    sig_trade_program = !is.na(zoho_trade_program) & zoho_trade_program == "true",
     sig_professional_type = !is.na(zoho_professional_type) &
       zoho_professional_type != "" & zoho_professional_type != "homeowner",
     sig_business_id = !is.na(zoho_business_id) & zoho_business_id != "",
     sig_business_entity = !is.na(zoho_business_entity) & zoho_business_entity != "",
     sig_tax_exempt = !is.na(zoho_tax_exempt) & zoho_tax_exempt %in% c("yes", "true", "y"),
+    # customerType metadata field (separate from Customer Type)
+    sig_customer_type_meta = !is.na(zoho_customer_type_meta) &
+      zoho_customer_type_meta %in% c("professional", "both"),
+    # tradeProgramInterest metadata (separate from Trade Program Interest)
+    sig_trade_interest_meta = !is.na(zoho_trade_interest_meta) &
+      zoho_trade_interest_meta %in% c("yes", "yes!"),
+    # professionalType has actual values (remodeler, home builder, etc.)
+    # Already handled by sig_professional_type above
+    # proProjectType — any value set indicates professional context
+    sig_pro_project_type = !is.na(zoho_pro_project_type) &
+      zoho_pro_project_type != "",
+    # Projects per Year — any value indicates professional volume
+    sig_projects_per_year = !is.na(zoho_projects_per_year) &
+      zoho_projects_per_year != "",
 
     # WEAK signals (need 2+ together)
     sig_company_raw = !is.na(zoho_company) &
@@ -125,13 +152,16 @@ zoho_classified <- zoho_clean %>%
     sig_email_raw = has_business_email,
 
     # Explicit residential signals
-    sig_residential = zoho_customer_type %in% c("homeowner", "residential") |
+    sig_residential = (zoho_customer_type %in% c("homeowner", "residential") |
       zoho_business_type %in% c("homeowner", "residential") |
-      zoho_contact_type %in% c("homeowner", "residential"),
+      zoho_contact_type %in% c("homeowner", "residential") |
+      zoho_customer_type_meta == "homeowner"),
 
     strong_signal_count = sig_customer_type + sig_business_type + sig_contact_type +
-      sig_trade_status + sig_trade_interest + sig_professional_type +
-      sig_business_id + sig_business_entity + sig_tax_exempt,
+      sig_trade_status + sig_trade_interest + sig_trade_program +
+      sig_professional_type + sig_business_id + sig_business_entity +
+      sig_tax_exempt + sig_customer_type_meta + sig_trade_interest_meta +
+      sig_pro_project_type + sig_projects_per_year,
     weak_signal_count = sig_company_raw + sig_email_raw,
     pro_signal_count = strong_signal_count + weak_signal_count,
     is_professional = (strong_signal_count >= 1) | (weak_signal_count >= 2),
@@ -186,7 +216,7 @@ stripe_clean <- stripe_customers %>%
 cat("\nStripe customers after cleaning:", nrow(stripe_clean), "\n")
 
 # Consolidate to one row per email (Stripe can have duplicates)
-customer_master <- stripe_clean %>%
+stripe_deduped <- stripe_clean %>%
   group_by(stripe_email) %>%
   summarise(
     stripe_name = first(na.omit(stripe_name)),
@@ -202,7 +232,25 @@ customer_master <- stripe_clean %>%
   filter(total_spend > 0) %>%
   mutate(first_year = year(first_seen))
 
-cat("Stripe paying customers (deduplicated):", nrow(customer_master), "\n")
+cat("Stripe paying customers (deduplicated, all time):", nrow(stripe_deduped), "\n")
+
+# Filter to customers active in 2023-2025:
+# 1. Created in 2023-2025 (definitely active in period), OR
+# 2. Have a BigCommerce order in 2023-2025 (confirms activity in period)
+bc_active_emails <- bc_clean %>%
+  filter(!is.na(match_email)) %>%
+  distinct(match_email) %>%
+  pull()
+
+customer_master <- stripe_deduped %>%
+  filter(
+    first_year >= 2023 |                         # Created during period
+    stripe_email %in% bc_active_emails           # Has BC order in 2023-2025
+  )
+
+cat("Stripe paying customers active 2023-2025:", nrow(customer_master), "\n")
+cat("  - Created 2023+:", sum(customer_master$first_year >= 2023), "\n")
+cat("  - Pre-2023 with BC orders in period:", sum(customer_master$first_year < 2023), "\n")
 
 # Classify from Zoho
 customer_master <- customer_master %>%

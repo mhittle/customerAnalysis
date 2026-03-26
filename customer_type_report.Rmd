@@ -72,9 +72,20 @@ zoho_clean <- zoho_contacts %>%
     zoho_lead_source = tolower(trimws(`Lead Source`)),
     zoho_trade_status = tolower(trimws(`Trade Program Status`)),
     zoho_trade_interest = tolower(trimws(`Trade Program Interest`)),
+    zoho_trade_program = tolower(trimws(`Trade Program`)),
     zoho_professional_type = tolower(trimws(ifelse(
       "professionalType" %in% names(.), `professionalType`, NA_character_
     ))),
+    zoho_customer_type_meta = tolower(trimws(ifelse(
+      "customerType" %in% names(.), `customerType`, NA_character_
+    ))),
+    zoho_trade_interest_meta = tolower(trimws(ifelse(
+      "tradeProgramInterest" %in% names(.), `tradeProgramInterest`, NA_character_
+    ))),
+    zoho_pro_project_type = tolower(trimws(ifelse(
+      "proProjectType" %in% names(.), `proProjectType`, NA_character_
+    ))),
+    zoho_projects_per_year = tolower(trimws(`Projects per Year`)),
     zoho_business_id = trimws(`Business ID`),
     zoho_business_entity = trimws(`Business Entity`),
     zoho_tax_exempt = tolower(trimws(`Tax Exempt?`)),
@@ -121,22 +132,32 @@ zoho_classified <- zoho_clean %>%
     sig_trade_interest = !is.na(zoho_trade_interest) & zoho_trade_interest != "" &
       zoho_trade_interest != "no" & zoho_trade_interest != "none" &
       zoho_trade_interest != "n/a",
+    sig_trade_program = !is.na(zoho_trade_program) & zoho_trade_program == "true",
     sig_professional_type = !is.na(zoho_professional_type) &
       zoho_professional_type != "" & zoho_professional_type != "homeowner",
     sig_business_id = !is.na(zoho_business_id) & zoho_business_id != "",
     sig_business_entity = !is.na(zoho_business_entity) & zoho_business_entity != "",
     sig_tax_exempt = !is.na(zoho_tax_exempt) & zoho_tax_exempt %in% c("yes", "true", "y"),
+    sig_customer_type_meta = !is.na(zoho_customer_type_meta) &
+      zoho_customer_type_meta %in% c("professional", "both"),
+    sig_trade_interest_meta = !is.na(zoho_trade_interest_meta) &
+      zoho_trade_interest_meta %in% c("yes", "yes!"),
+    sig_pro_project_type = !is.na(zoho_pro_project_type) & zoho_pro_project_type != "",
+    sig_projects_per_year = !is.na(zoho_projects_per_year) & zoho_projects_per_year != "",
     sig_company_raw = !is.na(zoho_company) &
       !(zoho_company %in% company_junk) &
       !(zoho_company == tolower(paste(zoho_first_name, zoho_last_name))) &
       !(zoho_company == tolower(zoho_last_name)),
     sig_email_raw = has_business_email,
-    sig_residential = zoho_customer_type %in% c("homeowner", "residential") |
+    sig_residential = (zoho_customer_type %in% c("homeowner", "residential") |
       zoho_business_type %in% c("homeowner", "residential") |
-      zoho_contact_type %in% c("homeowner", "residential"),
+      zoho_contact_type %in% c("homeowner", "residential") |
+      zoho_customer_type_meta == "homeowner"),
     strong_signal_count = sig_customer_type + sig_business_type + sig_contact_type +
-      sig_trade_status + sig_trade_interest + sig_professional_type +
-      sig_business_id + sig_business_entity + sig_tax_exempt,
+      sig_trade_status + sig_trade_interest + sig_trade_program +
+      sig_professional_type + sig_business_id + sig_business_entity +
+      sig_tax_exempt + sig_customer_type_meta + sig_trade_interest_meta +
+      sig_pro_project_type + sig_projects_per_year,
     weak_signal_count = sig_company_raw + sig_email_raw,
     pro_signal_count = strong_signal_count + weak_signal_count,
     is_professional = (strong_signal_count >= 1) | (weak_signal_count >= 2),
@@ -184,7 +205,7 @@ stripe_clean <- stripe_customers %>%
   filter(!is.na(stripe_email) & stripe_email != "")
 
 # Consolidate to one row per email (Stripe can have duplicates)
-customer_master <- stripe_clean %>%
+stripe_deduped <- stripe_clean %>%
   group_by(stripe_email) %>%
   summarise(
     stripe_name = first(na.omit(stripe_name)),
@@ -197,8 +218,18 @@ customer_master <- stripe_clean %>%
     first_seen = min(stripe_created, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  filter(total_spend > 0) %>%  # Only customers who actually purchased
+  filter(total_spend > 0) %>%
   mutate(first_year = year(first_seen))
+
+# Filter to customers active in 2023-2025
+bc_active_emails <- bc_clean %>%
+  filter(!is.na(match_email)) %>% distinct(match_email) %>% pull()
+
+customer_master <- stripe_deduped %>%
+  filter(
+    first_year >= 2023 |                   # Created during period
+    stripe_email %in% bc_active_emails     # Has BC order in 2023-2025
+  )
 
 # Classify from Zoho
 customer_master <- customer_master %>%
@@ -675,11 +706,18 @@ Customers are classified as **Professional** if they exhibit any **strong signal
 
 **Strong signals** (any one is sufficient):
 
-- CRM Customer Type = commercial, professional, contractor, builder, designer, etc.
-- CRM Business Type is set (e.g., general contractor, cabinet shop, property management)
-- CRM Contact Type = professional, commercial, contractor, trade
-- Active trade program status or expressed trade program interest
-- Business ID or Business Entity on file
+- CRM `Customer Type` = commercial, professional, contractor, builder, designer, etc.
+- CRM `Business Type` is set (e.g., general contractor, cabinet shop, property management)
+- CRM `Contact Type` = professional, commercial, contractor, trade
+- CRM `Trade Program Status` is active
+- CRM `Trade Program Interest` expressed
+- CRM `Trade Program` = true (boolean field)
+- CRM `professionalType` metadata (remodeler, home builder, handyman, cabinet shop, interior designer, etc.)
+- CRM `customerType` metadata = professional or both
+- CRM `tradeProgramInterest` metadata = yes
+- CRM `proProjectType` metadata is set (indicates professional project context)
+- CRM `Projects per Year` is set (indicates professional order volume)
+- `Business ID` or `Business Entity` on file
 - Tax exempt status
 
 **Weak signals** (require two together):
@@ -687,13 +725,17 @@ Customers are classified as **Professional** if they exhibit any **strong signal
 - Company name on file (after filtering junk entries like personal names, "home", "yes", "kitchen")
 - Non-personal email domain (i.e., not Gmail, Yahoo, Outlook, etc.)
 
-**Residential**: Explicitly tagged as homeowner/residential in CRM with no professional signals.
+**Residential**: Explicitly tagged as homeowner/residential in CRM `Customer Type`, `Business Type`, `Contact Type`, or `customerType` metadata, with no professional signals.
 
 **Unknown (assumed Residential)**: No signals in any direction. Conservatively grouped with Residential but tracked separately for transparency.
 
+## Scope
+
+Only Stripe customers active in the 2023--2025 period are included. A customer is considered active if their Stripe account was created in 2023 or later, OR if they have a BigCommerce order dated within 2023--2025.
+
 ## Merge Strategy
 
-All systems are joined on **email address** (lowercased, trimmed). Stripe serves as the master customer list. Zoho CRM provides the primary classification. BigCommerce provides fallback signals (shipping company, customer group) and order-level date data for yearly trend analysis.
+All systems are joined on **email address** (lowercased, trimmed). Stripe serves as the master customer list (deduplicated by email, filtered to paying customers with activity in 2023--2025). Zoho CRM provides the primary classification via 14 strong signals and 2 weak signals. BigCommerce provides fallback signals (shipping company, customer group) and order-level date data for yearly trend analysis.
 
 ---
 
