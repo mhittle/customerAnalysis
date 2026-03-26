@@ -1,6 +1,6 @@
 ---
-title: "Customer Segmentation Analysis"
-subtitle: "Residential vs. Professional Order Breakdown"
+title: "Customer & Revenue Analysis"
+subtitle: "Order Economics, Customer Segmentation, and Growth Opportunity"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
   html_document:
@@ -888,6 +888,466 @@ coverage_tbl <- tibble(
 kable(coverage_tbl, align = "lr")
 ```
 
+# Order Economics Deep Dive
+
+```{r order-economics-data}
+# BigCommerce has order-level detail with dates — use for deep order analysis
+# Enrich with classification from customer_master
+
+order_detail <- bc_clean %>%
+  mutate(
+    order_month = floor_date(order_date, "month"),
+    order_quarter = floor_date(order_date, "quarter"),
+    bc_match_name = tolower(trimws(customer_name))
+  ) %>%
+  left_join(customer_master %>% select(stripe_email, broad_class, final_class),
+            by = c("match_email" = "stripe_email")) %>%
+  mutate(broad_class = ifelse(is.na(broad_class), "Residential", broad_class))
+
+# Order size buckets
+order_detail <- order_detail %>%
+  mutate(
+    size_bucket = case_when(
+      order_total < 50    ~ "Under $50",
+      order_total < 150   ~ "$50-$149",
+      order_total < 300   ~ "$150-$299",
+      order_total < 500   ~ "$300-$499",
+      order_total < 1000  ~ "$500-$999",
+      order_total < 2500  ~ "$1,000-$2,499",
+      order_total < 5000  ~ "$2,500-$4,999",
+      order_total >= 5000 ~ "$5,000+"
+    ),
+    size_bucket = factor(size_bucket, levels = c(
+      "Under $50", "$50-$149", "$150-$299", "$300-$499",
+      "$500-$999", "$1,000-$2,499", "$2,500-$4,999", "$5,000+"
+    )),
+    is_core_order = order_total >= 150  # Exclude sample/small orders
+  )
+
+# Summary stats
+n_orders_total <- nrow(order_detail)
+n_orders_core <- sum(order_detail$is_core_order)
+pct_core_orders <- round(n_orders_core / n_orders_total * 100, 1)
+rev_core <- sum(order_detail$order_total[order_detail$is_core_order], na.rm = TRUE)
+rev_total <- sum(order_detail$order_total, na.rm = TRUE)
+pct_core_rev <- round(rev_core / rev_total * 100, 1)
+```
+
+Understanding order economics is critical to valuing this business. While the company processes a high volume of smaller orders (samples, replacement parts), the revenue engine is driven by substantial project-based orders from both professional and residential customers.
+
+## Order Size Distribution
+
+```{r order-size-dist, fig.height=6}
+bucket_summary <- order_detail %>%
+  group_by(size_bucket) %>%
+  summarise(
+    orders = n(),
+    revenue = sum(order_total, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_orders = round(orders / sum(orders) * 100, 1),
+    pct_revenue = round(revenue / sum(revenue) * 100, 1),
+    cum_rev_pct = cumsum(pct_revenue)
+  )
+
+gridExtra::grid.arrange(
+  bucket_summary %>%
+    ggplot(aes(x = size_bucket, y = orders)) +
+    geom_col(fill = "#2C5F8A", width = 0.7) +
+    geom_text(aes(label = comma(orders)), vjust = -0.3, size = 3.5) +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+    labs(title = "Order Count by Size", x = "", y = "Orders") +
+    theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+
+  bucket_summary %>%
+    ggplot(aes(x = size_bucket, y = revenue)) +
+    geom_col(fill = "#E8894A", width = 0.7) +
+    geom_text(aes(label = dollar(revenue, accuracy = 1, scale = 1e-3, suffix = "K")),
+              vjust = -0.3, size = 3.5) +
+    scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
+    labs(title = "Revenue by Order Size", x = "", y = "Revenue") +
+    theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+
+  ncol = 2
+)
+```
+
+```{r order-size-table}
+bucket_tbl <- bucket_summary %>%
+  transmute(
+    `Order Size` = size_bucket,
+    Orders = comma(orders),
+    `% of Orders` = paste0(pct_orders, "%"),
+    Revenue = dollar(revenue),
+    `% of Revenue` = paste0(pct_revenue, "%"),
+    `Cumulative Rev %` = paste0(cum_rev_pct, "%")
+  )
+kable(bucket_tbl, align = "lrrrrr")
+```
+
+> **Key insight:** Orders under $150 represent a disproportionate share of order *count* but a small fraction of *revenue*. The revenue engine is concentrated in orders $300+, which represent the core remodeling and new construction projects that define this business.
+
+## Core Order Metrics (Excluding Orders Under $150)
+
+Small orders (samples, single replacement doors, hardware) distort averages. The following metrics focus on **core orders ($150+)** to reflect the true economics of the project business.
+
+```{r core-metrics-table}
+core_metrics <- order_detail %>%
+  group_by(broad_class) %>%
+  summarise(
+    `All Orders - Count` = n(),
+    `All Orders - Mean` = dollar(mean(order_total, na.rm = TRUE)),
+    `All Orders - Median` = dollar(median(order_total, na.rm = TRUE)),
+    `Core Orders ($150+) - Count` = sum(is_core_order),
+    `Core Orders ($150+) - Mean` = dollar(mean(order_total[is_core_order], na.rm = TRUE)),
+    `Core Orders ($150+) - Median` = dollar(median(order_total[is_core_order], na.rm = TRUE)),
+    `Core as % of Revenue` = paste0(round(sum(order_total[is_core_order], na.rm = TRUE) /
+      sum(order_total, na.rm = TRUE) * 100, 1), "%"),
+    .groups = "drop"
+  )
+
+kable(core_metrics %>% rename(Type = broad_class), align = "lrrrrrrr")
+```
+
+```{r core-metrics-overall}
+overall_core <- order_detail %>%
+  summarise(
+    all_mean = mean(order_total, na.rm = TRUE),
+    all_median = median(order_total, na.rm = TRUE),
+    core_mean = mean(order_total[is_core_order], na.rm = TRUE),
+    core_median = median(order_total[is_core_order], na.rm = TRUE),
+    core_rev_pct = round(sum(order_total[is_core_order], na.rm = TRUE) /
+      sum(order_total, na.rm = TRUE) * 100, 1)
+  )
+```
+
+> Core orders ($150+) represent **`r overall_core$core_rev_pct`%** of total revenue. The core order mean is **`r dollar(overall_core$core_mean)`** vs. the all-orders mean of **`r dollar(overall_core$all_mean)`** — a `r round((overall_core$core_mean / overall_core$all_mean - 1) * 100)`% difference that illustrates how small orders dilute the true project economics.
+
+## Order Size by Customer Type
+
+```{r order-size-by-type, fig.height=6}
+bucket_by_type <- order_detail %>%
+  group_by(size_bucket, broad_class) %>%
+  summarise(orders = n(), revenue = sum(order_total, na.rm = TRUE), .groups = "drop") %>%
+  group_by(broad_class) %>%
+  mutate(
+    pct_orders = round(orders / sum(orders) * 100, 1),
+    pct_revenue = round(revenue / sum(revenue) * 100, 1)
+  ) %>%
+  ungroup()
+
+bucket_by_type %>%
+  ggplot(aes(x = size_bucket, y = revenue, fill = broad_class)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = colors_class) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Revenue by Order Size and Customer Type",
+       x = "", y = "Revenue", fill = "Customer Type") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r order-size-pct-type, fig.height=5}
+bucket_by_type %>%
+  ggplot(aes(x = size_bucket, y = pct_revenue, fill = broad_class)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = paste0(pct_revenue, "%")),
+            position = position_dodge(width = 0.7), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = colors_class) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Revenue Concentration by Order Size",
+       subtitle = "% of each customer type's revenue from each order size tier",
+       x = "", y = "% of Revenue", fill = "Customer Type") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Revenue Trends Over Time
+
+```{r monthly-revenue, fig.height=5}
+monthly_rev <- order_detail %>%
+  group_by(order_month) %>%
+  summarise(
+    revenue = sum(order_total, na.rm = TRUE),
+    orders = n(),
+    avg_order = mean(order_total, na.rm = TRUE),
+    core_orders = sum(is_core_order),
+    core_revenue = sum(order_total[is_core_order], na.rm = TRUE),
+    core_avg = mean(order_total[is_core_order], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+monthly_rev %>%
+  ggplot(aes(x = order_month, y = revenue)) +
+  geom_col(fill = "#2C5F8A", width = 25) +
+  geom_smooth(se = FALSE, color = "#E8894A", linewidth = 1.2, method = "loess", span = 0.3) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Monthly Revenue",
+       subtitle = "With trend line (BigCommerce orders)",
+       x = "", y = "Revenue") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r monthly-by-type, fig.height=5}
+monthly_by_type <- order_detail %>%
+  group_by(order_month, broad_class) %>%
+  summarise(revenue = sum(order_total, na.rm = TRUE), .groups = "drop")
+
+monthly_by_type %>%
+  ggplot(aes(x = order_month, y = revenue, fill = broad_class)) +
+  geom_area(alpha = 0.8) +
+  scale_fill_manual(values = colors_class) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Monthly Revenue by Customer Type",
+       x = "", y = "Revenue", fill = "Customer Type") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Seasonality & Cyclicality
+
+```{r seasonality, fig.height=5}
+seasonal <- order_detail %>%
+  mutate(month_num = month(order_date), month_name = month(order_date, label = TRUE)) %>%
+  group_by(order_year, month_num, month_name) %>%
+  summarise(revenue = sum(order_total, na.rm = TRUE),
+            orders = n(), .groups = "drop")
+
+seasonal_avg <- seasonal %>%
+  group_by(month_num, month_name) %>%
+  summarise(
+    avg_revenue = mean(revenue, na.rm = TRUE),
+    min_revenue = min(revenue, na.rm = TRUE),
+    max_revenue = max(revenue, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot() +
+  geom_ribbon(data = seasonal_avg, aes(x = month_num, ymin = min_revenue, ymax = max_revenue),
+              fill = "#2C5F8A", alpha = 0.15) +
+  geom_line(data = seasonal, aes(x = month_num, y = revenue, color = factor(order_year)),
+            linewidth = 1) +
+  geom_line(data = seasonal_avg, aes(x = month_num, y = avg_revenue),
+            linewidth = 1.5, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_y_continuous(labels = dollar) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Revenue Seasonality",
+       subtitle = "Monthly revenue by year with 3-year average (dashed) and range (shaded)",
+       x = "", y = "Revenue", color = "Year") +
+  theme_buyer
+```
+
+```{r seasonality-orders, fig.height=5}
+seasonal_orders <- order_detail %>%
+  mutate(month_num = month(order_date), month_name = month(order_date, label = TRUE)) %>%
+  group_by(month_num, month_name) %>%
+  summarise(
+    avg_orders = mean(n()),
+    avg_core_order = mean(order_total[is_core_order], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+seasonal %>%
+  ggplot(aes(x = month_num, y = orders, color = factor(order_year))) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_y_continuous(labels = comma) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Order Volume Seasonality",
+       subtitle = "Monthly order count by year",
+       x = "", y = "Orders", color = "Year") +
+  theme_buyer
+```
+
+```{r quarterly-growth, fig.height=5}
+quarterly <- order_detail %>%
+  group_by(order_quarter) %>%
+  summarise(
+    revenue = sum(order_total, na.rm = TRUE),
+    orders = n(),
+    core_revenue = sum(order_total[is_core_order], na.rm = TRUE),
+    core_avg = mean(order_total[is_core_order], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rev_yoy = (revenue / lag(revenue, 4) - 1) * 100,
+    quarter_label = paste0("Q", quarter(order_quarter), " ", year(order_quarter))
+  )
+
+quarterly %>%
+  filter(!is.na(rev_yoy)) %>%
+  ggplot(aes(x = order_quarter, y = rev_yoy)) +
+  geom_col(aes(fill = rev_yoy > 0), width = 80, show.legend = FALSE) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  geom_text(aes(label = paste0(round(rev_yoy, 1), "%")), vjust = ifelse(quarterly$rev_yoy[!is.na(quarterly$rev_yoy)] > 0, -0.5, 1.5), size = 3.5) +
+  scale_fill_manual(values = c("TRUE" = "#2C5F8A", "FALSE" = "#C0392B")) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Year-over-Year Quarterly Revenue Growth",
+       x = "", y = "YoY Growth %") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Average Order Value Trends
+
+```{r aov-trends, fig.height=5}
+monthly_aov <- order_detail %>%
+  group_by(order_month) %>%
+  summarise(
+    all_mean = mean(order_total, na.rm = TRUE),
+    all_median = median(order_total, na.rm = TRUE),
+    core_mean = mean(order_total[is_core_order], na.rm = TRUE),
+    core_median = median(order_total[is_core_order], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-order_month, names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric = recode(metric,
+      "all_mean" = "All Orders - Mean",
+      "all_median" = "All Orders - Median",
+      "core_mean" = "Core ($150+) - Mean",
+      "core_median" = "Core ($150+) - Median"
+    ),
+    is_core = grepl("Core", metric)
+  )
+
+monthly_aov %>%
+  ggplot(aes(x = order_month, y = value, color = metric)) +
+  geom_line(aes(linewidth = is_core, linetype = grepl("Median", metric)), show.legend = TRUE) +
+  scale_linewidth_manual(values = c("TRUE" = 1.2, "FALSE" = 0.6), guide = "none") +
+  scale_linetype_manual(values = c("TRUE" = "dashed", "FALSE" = "solid"), guide = "none") +
+  scale_color_manual(values = c(
+    "All Orders - Mean" = "#B0BEC5", "All Orders - Median" = "#CFD8DC",
+    "Core ($150+) - Mean" = "#2C5F8A", "Core ($150+) - Median" = "#E8894A"
+  )) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Average Order Value Over Time",
+       subtitle = "All orders vs. core orders ($150+); solid = mean, dashed = median",
+       x = "", y = "Order Value", color = "") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Revenue Concentration
+
+```{r revenue-concentration, fig.height=5}
+# Customer-level revenue concentration (from Stripe master)
+cust_ranked <- customer_master %>%
+  arrange(desc(total_spend)) %>%
+  mutate(
+    cust_rank = row_number(),
+    cum_revenue = cumsum(total_spend),
+    cum_pct = cum_revenue / sum(total_spend) * 100,
+    cust_pct = cust_rank / n() * 100
+  )
+
+# Key concentration metrics
+top_10_pct <- cust_ranked %>% filter(cust_pct <= 10) %>% slice_tail(n = 1) %>% pull(cum_pct)
+top_20_pct <- cust_ranked %>% filter(cust_pct <= 20) %>% slice_tail(n = 1) %>% pull(cum_pct)
+top_50_pct <- cust_ranked %>% filter(cust_pct <= 50) %>% slice_tail(n = 1) %>% pull(cum_pct)
+
+cust_ranked %>%
+  ggplot(aes(x = cust_pct, y = cum_pct)) +
+  geom_line(color = "#2C5F8A", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+  geom_segment(aes(x = 20, xend = 20, y = 0, yend = top_20_pct),
+               linetype = "dotted", color = "#E8894A") +
+  geom_segment(aes(x = 0, xend = 20, y = top_20_pct, yend = top_20_pct),
+               linetype = "dotted", color = "#E8894A") +
+  annotate("text", x = 22, y = top_20_pct - 3,
+           label = paste0("Top 20% = ", round(top_20_pct, 1), "% of revenue"),
+           hjust = 0, size = 4, fontface = "bold", color = "#E8894A") +
+  scale_x_continuous(labels = function(x) paste0(x, "%"), breaks = seq(0, 100, 10)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), breaks = seq(0, 100, 10)) +
+  labs(title = "Revenue Concentration (Lorenz Curve)",
+       subtitle = "How revenue is distributed across the customer base",
+       x = "% of Customers (ranked by revenue)", y = "Cumulative % of Revenue") +
+  theme_buyer
+```
+
+```{r concentration-table}
+conc_tbl <- tibble(
+  Segment = c("Top 1%", "Top 5%", "Top 10%", "Top 20%", "Top 50%", "Bottom 50%"),
+  `% of Revenue` = c(
+    paste0(round(cust_ranked %>% filter(cust_pct <= 1) %>% slice_tail(n = 1) %>% pull(cum_pct), 1), "%"),
+    paste0(round(cust_ranked %>% filter(cust_pct <= 5) %>% slice_tail(n = 1) %>% pull(cum_pct), 1), "%"),
+    paste0(round(top_10_pct, 1), "%"),
+    paste0(round(top_20_pct, 1), "%"),
+    paste0(round(top_50_pct, 1), "%"),
+    paste0(round(100 - top_50_pct, 1), "%")
+  ),
+  Customers = c(
+    comma(round(nrow(cust_ranked) * 0.01)),
+    comma(round(nrow(cust_ranked) * 0.05)),
+    comma(round(nrow(cust_ranked) * 0.10)),
+    comma(round(nrow(cust_ranked) * 0.20)),
+    comma(round(nrow(cust_ranked) * 0.50)),
+    comma(round(nrow(cust_ranked) * 0.50))
+  )
+)
+kable(conc_tbl, align = "lrr")
+```
+
+## Revenue Concentration by Customer Type
+
+```{r concentration-by-type, fig.height=5}
+conc_by_type <- customer_master %>%
+  group_by(broad_class) %>%
+  arrange(desc(total_spend)) %>%
+  mutate(
+    cust_rank = row_number(),
+    cum_revenue = cumsum(total_spend),
+    cum_pct = cum_revenue / sum(total_spend) * 100,
+    cust_pct = cust_rank / n() * 100
+  ) %>%
+  ungroup()
+
+conc_by_type %>%
+  ggplot(aes(x = cust_pct, y = cum_pct, color = broad_class)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+  scale_color_manual(values = colors_class) +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Revenue Concentration by Customer Type",
+       subtitle = "Steeper curve = more concentrated in top customers",
+       x = "% of Customers (ranked by revenue)",
+       y = "Cumulative % of Revenue", color = "Customer Type") +
+  theme_buyer
+```
+
+## Strategic Opportunity: Professional Segment
+
+```{r strategic-summary}
+pro_stats <- customer_master %>% filter(broad_class == "Professional") %>%
+  summarise(customers = n(), revenue = sum(total_spend), orders = sum(total_orders),
+            avg_ltv = mean(total_spend), median_ltv = median(total_spend),
+            avg_orders = mean(total_orders), repeat_rate = mean(is_repeat) * 100,
+            avg_order = sum(total_spend) / sum(total_orders))
+
+res_stats <- customer_master %>% filter(broad_class == "Residential") %>%
+  summarise(customers = n(), revenue = sum(total_spend), orders = sum(total_orders),
+            avg_ltv = mean(total_spend), median_ltv = median(total_spend),
+            avg_orders = mean(total_orders), repeat_rate = mean(is_repeat) * 100,
+            avg_order = sum(total_spend) / sum(total_orders))
+
+ltv_multiple <- round(pro_stats$avg_ltv / res_stats$avg_ltv, 1)
+aov_multiple <- round(pro_stats$avg_order / res_stats$avg_order, 1)
+repeat_delta <- round(pro_stats$repeat_rate - res_stats$repeat_rate, 1)
+```
+
+The professional segment represents a compelling acquisition thesis:
+
+| Metric | Professional | Residential | Pro Advantage |
+|--------|-------------|-------------|---------------|
+| Avg LTV | `r dollar(pro_stats$avg_ltv)` | `r dollar(res_stats$avg_ltv)` | **`r ltv_multiple`x** |
+| Avg Order Size | `r dollar(pro_stats$avg_order)` | `r dollar(res_stats$avg_order)` | **`r aov_multiple`x** |
+| Repeat Rate | `r paste0(round(pro_stats$repeat_rate, 1), "%")` | `r paste0(round(res_stats$repeat_rate, 1), "%")` | **+`r repeat_delta`pp** |
+| Avg Orders/Customer | `r round(pro_stats$avg_orders, 1)` | `r round(res_stats$avg_orders, 1)` | **`r round(pro_stats$avg_orders / res_stats$avg_orders, 1)`x** |
+
+> **For Eagle Woodworking:** The professional customer segment delivers `r ltv_multiple`x the lifetime value of residential customers with `r repeat_delta` percentage points higher repeat rates. An acquirer with existing professional relationships and capacity in cabinet door manufacturing can accelerate growth in this high-LTV segment through cross-selling and trade program expansion, while the residential base provides stable, diversified volume.
+
 # Methodology
 
 ## Data Sources
@@ -895,8 +1355,10 @@ kable(coverage_tbl, align = "lr")
 | Source | Role | Records |
 |--------|------|---------|
 | **Stripe** | Authoritative payment data: customer totals, order counts, revenue | `r comma(nrow(stripe_customers))` raw records |
-| **Zoho CRM** | Customer classification: type, trade program, business info | `r comma(nrow(zoho_contacts))` contacts |
-| **BigCommerce** | Order-level detail with dates (partial coverage) for yearly trends | `r comma(nrow(bc_orders))` orders |
+| **Zoho CRM Contacts** | Customer classification: type, trade program, business info | `r comma(nrow(zoho_contacts))` contacts |
+| **Zoho CRM Accounts** | Additional classification source with overlapping fields | `r comma(nrow(zoho_accounts))` accounts |
+| **BigCommerce Orders** | Order-level detail with dates for trends and order economics | `r comma(nrow(bc_orders))` orders |
+| **BigCommerce Customers** | Customer-level data with Company field | `r comma(nrow(bc_customers))` customers |
 
 ## Classification Logic
 
