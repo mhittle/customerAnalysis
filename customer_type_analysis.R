@@ -333,11 +333,86 @@ cat("Stripe paying customers active 2023-2025:", nrow(customer_master), "\n")
 cat("  - Created 2023+:", sum(customer_master$first_year >= 2023), "\n")
 cat("  - Pre-2023 with BC orders in period:", sum(customer_master$first_year < 2023), "\n")
 
-# Classify from Zoho
+# --- Classify from Zoho (email match first, then name fallback) ---
+
+# Step 1: Email match
 customer_master <- customer_master %>%
   left_join(zoho_lookup %>% select(zoho_email, customer_class, classification_confidence,
                                     pro_signal_count),
             by = c("stripe_email" = "zoho_email"))
+
+email_matched <- sum(!is.na(customer_master$customer_class))
+cat("\nZoho classification - email match:", email_matched, "customers\n")
+
+# Step 2: Name-based fallback for unmatched customers
+# Build a name lookup from Zoho contacts (only classified ones, deduplicated)
+zoho_name_lookup <- zoho_classified %>%
+  filter(!is.na(zoho_full_name) & zoho_full_name != "" &
+         zoho_full_name != "NA NA" & nchar(zoho_full_name) > 3) %>%
+  mutate(match_name = tolower(zoho_full_name)) %>%
+  group_by(match_name) %>%
+  slice_max(pro_signal_count, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  # Exclude very common/ambiguous names (appearing too many times = unreliable)
+  add_count(match_name, name = "name_freq") %>%
+  filter(name_freq == 1) %>%
+  select(match_name,
+         name_customer_class = customer_class,
+         name_confidence = classification_confidence,
+         name_signal_count = pro_signal_count)
+
+# Standardize Stripe names for matching
+customer_master <- customer_master %>%
+  mutate(stripe_match_name = tolower(trimws(stripe_name)))
+
+# Apply name match only where email didn't match
+name_join <- customer_master %>%
+  filter(is.na(customer_class) & !is.na(stripe_match_name) & stripe_match_name != "") %>%
+  select(stripe_email, stripe_match_name) %>%
+  inner_join(zoho_name_lookup, by = c("stripe_match_name" = "match_name"))
+
+# Merge name matches back
+customer_master <- customer_master %>%
+  left_join(name_join %>% select(stripe_email, name_customer_class, name_confidence, name_signal_count),
+            by = "stripe_email") %>%
+  mutate(
+    customer_class = ifelse(is.na(customer_class), name_customer_class, customer_class),
+    classification_confidence = ifelse(is.na(classification_confidence), name_confidence, classification_confidence),
+    pro_signal_count = ifelse(is.na(pro_signal_count), name_signal_count, pro_signal_count)
+  ) %>%
+  select(-name_customer_class, -name_confidence, -name_signal_count)
+
+name_matched <- sum(!is.na(customer_master$customer_class)) - email_matched
+cat("Zoho classification - name match (fallback):", name_matched, "additional customers\n")
+
+# --- Also build name lookup from BigCommerce for company/group signals ---
+bc_name_lookup <- bc_clean %>%
+  filter(!is.na(customer_name) & customer_name != "") %>%
+  mutate(match_name = tolower(trimws(customer_name))) %>%
+  group_by(match_name) %>%
+  summarise(
+    bc_shipping_company_name = first(na.omit(shipping_company)),
+    bc_billing_company_name = first(na.omit(billing_company)),
+    bc_customer_group_name = first(na.omit(customer_group)),
+    .groups = "drop"
+  ) %>%
+  add_count(match_name, name = "name_freq") %>%
+  filter(name_freq == 1) %>%  # Only unique names
+  mutate(
+    bc_name_has_company = (!is.na(bc_shipping_company_name) & bc_shipping_company_name != "" &
+      !bc_shipping_company_name %in% c("n/a", "na", "none", "-")) |
+      (!is.na(bc_billing_company_name) & bc_billing_company_name != "" &
+      !bc_billing_company_name %in% c("n/a", "na", "none", "-")),
+    bc_name_group_pro = bc_customer_group_name %in% c(
+      "professional", "commercial", "trade", "wholesale", "dealer",
+      "contractor", "builder", "business"
+    ),
+    bc_name_is_pro = bc_name_has_company | bc_name_group_pro
+  ) %>%
+  filter(bc_name_is_pro) %>%
+  select(match_name, bc_name_is_pro)
+
+cat("BC name-based pro signals:", nrow(bc_name_lookup), "unique names\n")
 
 # Enrich from BigCommerce for unmatched
 # Three places in BC that can indicate professional:
@@ -369,15 +444,18 @@ customer_master <- customer_master %>%
   left_join(bc_company_lookup, by = c("stripe_email" = "match_email")) %>%
   left_join(acct_lookup, by = c("stripe_email" = "acct_email")) %>%
   left_join(bc_address_signal, by = c("stripe_email" = "match_email")) %>%
+  left_join(bc_name_lookup, by = c("stripe_match_name" = "match_name")) %>%
   mutate(
     acct_is_professional = ifelse(is.na(acct_is_professional), FALSE, acct_is_professional),
     has_diff_ship_bill = ifelse(is.na(has_diff_ship_bill), FALSE, has_diff_ship_bill),
+    bc_name_is_pro = ifelse(is.na(bc_name_is_pro), FALSE, bc_name_is_pro),
 
     # Professional always wins: if ANY source says pro, they're pro
     final_class = case_when(
       customer_class == "Professional"       ~ "Professional",
       acct_is_professional                   ~ "Professional",
       bc_has_company | bc_group_pro          ~ "Professional",
+      bc_name_is_pro                         ~ "Professional",
       has_diff_ship_bill                     ~ "Professional",
       customer_class == "Residential"        ~ "Residential",
       TRUE                                   ~ "Unknown"
@@ -421,20 +499,29 @@ customer_master %>%
 # ==========================================================================
 
 orders_merged <- bc_clean %>%
+  mutate(bc_match_name = tolower(trimws(customer_name))) %>%
   left_join(zoho_lookup %>% select(zoho_email, customer_class),
             by = c("match_email" = "zoho_email")) %>%
+  # Name fallback for Zoho classification
+  left_join(zoho_name_lookup %>% select(match_name, name_customer_class),
+            by = c("bc_match_name" = "match_name")) %>%
+  mutate(customer_class = ifelse(is.na(customer_class), name_customer_class, customer_class)) %>%
+  select(-name_customer_class) %>%
   left_join(bc_company_lookup %>% select(match_email, bc_has_company, bc_group_pro),
             by = c("match_email" = "match_email")) %>%
   left_join(acct_lookup, by = c("match_email" = "acct_email")) %>%
   left_join(bc_address_signal, by = c("match_email" = "match_email")) %>%
+  left_join(bc_name_lookup, by = c("bc_match_name" = "match_name")) %>%
   mutate(
     acct_is_professional = ifelse(is.na(acct_is_professional), FALSE, acct_is_professional),
     has_diff_ship_bill = ifelse(is.na(has_diff_ship_bill), FALSE, has_diff_ship_bill),
+    bc_name_is_pro = ifelse(is.na(bc_name_is_pro), FALSE, bc_name_is_pro),
     # Professional always wins
     final_class = case_when(
       customer_class == "Professional"       ~ "Professional",
       acct_is_professional                   ~ "Professional",
       bc_has_company | bc_group_pro          ~ "Professional",
+      bc_name_is_pro                         ~ "Professional",
       has_diff_ship_bill                     ~ "Professional",
       customer_class == "Residential"        ~ "Residential",
       TRUE                                   ~ "Unknown"
