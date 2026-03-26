@@ -1,11 +1,9 @@
 # =============================================================================
 # Customer Type Analysis: Residential vs Commercial/Professional
-# Merges BigCommerce orders with Zoho CRM contacts to classify customers
-# and produce buyer-ready metrics and visualizations for 2023-2025
+# Stripe as authority, Zoho CRM for classification, BigCommerce for yearly trends
 # =============================================================================
 
 # --- 1. Load Libraries -------------------------------------------------------
-# Load individual tidyverse packages to avoid the 'fs' dependency issue
 library(dplyr)
 library(ggplot2)
 library(readr)
@@ -28,7 +26,7 @@ cat("Stripe customers loaded:", nrow(stripe_customers), "rows\n")
 
 bc_clean <- bc_orders %>%
   mutate(
-    order_date = mdy(`Order Date`),  # adjust parser if your date format differs
+    order_date = mdy(`Order Date`),
     order_year = year(order_date),
     order_total = as.numeric(gsub("[^0-9.]", "", `Order Total (inc tax)`)),
     customer_email = tolower(trimws(`Customer Email`)),
@@ -41,8 +39,6 @@ bc_clean <- bc_orders %>%
     shipping_name = trimws(`Shipping Name`)
   ) %>%
   filter(order_year %in% c(2023, 2024, 2025)) %>%
-  # Use customer email as primary key; fall back to billing email
-
   mutate(
     match_email = case_when(
       !is.na(customer_email) & customer_email != "" ~ customer_email,
@@ -76,10 +72,8 @@ zoho_clean <- zoho_contacts %>%
     zoho_full_name = trimws(paste(zoho_first_name, zoho_last_name))
   )
 
-# --- 5. Classify Zoho Contacts as Professional/Residential -------------------
-# Strategy: sensitive to professional signals (catch as many as possible)
+# --- 5. Classify Zoho Contacts -----------------------------------------------
 
-# Define professional email domain patterns (common business-ish domains excluded)
 personal_email_domains <- c(
   "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
   "icloud.com", "me.com", "mac.com", "live.com", "msn.com",
@@ -90,7 +84,6 @@ personal_email_domains <- c(
   "zoho.com", "fastmail.com", "hushmail.com", "inbox.com", "gmx.com"
 )
 
-## Junk values commonly found in Zoho Account Name field
 company_junk <- c(
   "", "n/a", "na", "none", "no", "self", "retired", "home", "homeowner",
   "yes", "kitchen", "bath", "bathroom", "bathroom remodel", "cabinet doors",
@@ -103,11 +96,10 @@ zoho_classified <- zoho_clean %>%
     email_domain = str_extract(zoho_email, "(?<=@)[^@]+$"),
     has_business_email = !is.na(email_domain) & !(email_domain %in% personal_email_domains),
 
-    # --- STRONG signals (each one alone = Professional) ---
+    # STRONG signals (any one alone = Professional)
     sig_customer_type = zoho_customer_type %in% c(
       "professional", "commercial", "contractor", "builder", "designer",
       "architect", "trade", "dealer", "wholesale", "business"
-      # "other" excluded — too ambiguous
     ),
     sig_business_type = !is.na(zoho_business_type) & zoho_business_type != "" &
       zoho_business_type != "homeowner" & zoho_business_type != "residential",
@@ -125,8 +117,7 @@ zoho_classified <- zoho_clean %>%
     sig_business_entity = !is.na(zoho_business_entity) & zoho_business_entity != "",
     sig_tax_exempt = !is.na(zoho_tax_exempt) & zoho_tax_exempt %in% c("yes", "true", "y"),
 
-    # --- WEAK signals (only count when combined with another signal) ---
-    # Company name: filter out junk values and personal names (first+last match)
+    # WEAK signals (need 2+ together)
     sig_company_raw = !is.na(zoho_company) &
       !(zoho_company %in% company_junk) &
       !(zoho_company == tolower(paste(zoho_first_name, zoho_last_name))) &
@@ -138,50 +129,35 @@ zoho_classified <- zoho_clean %>%
       zoho_business_type %in% c("homeowner", "residential") |
       zoho_contact_type %in% c("homeowner", "residential"),
 
-    # Count STRONG professional signals
     strong_signal_count = sig_customer_type + sig_business_type + sig_contact_type +
       sig_trade_status + sig_trade_interest + sig_professional_type +
       sig_business_id + sig_business_entity + sig_tax_exempt,
-
-    # Count WEAK signals
     weak_signal_count = sig_company_raw + sig_email_raw,
-
-    # Total for reference
     pro_signal_count = strong_signal_count + weak_signal_count,
-
-    # Classification logic:
-    # - Any strong signal = Professional
-    # - Two weak signals together (company + business email) = Professional
-    # - One weak signal alone = not enough
     is_professional = (strong_signal_count >= 1) | (weak_signal_count >= 2),
 
     customer_class = case_when(
-      is_professional & !sig_residential  ~ "Professional",
-      is_professional & sig_residential   ~ "Professional",  # pro signals override
-      sig_residential                     ~ "Residential",
-      TRUE                                ~ "Unknown"
+      is_professional & !sig_residential ~ "Professional",
+      is_professional & sig_residential  ~ "Professional",
+      sig_residential                    ~ "Residential",
+      TRUE                               ~ "Unknown"
     ),
-
-    # Confidence level
     classification_confidence = case_when(
-      strong_signal_count >= 2                   ~ "High",
-      strong_signal_count == 1                   ~ "Medium",
-      weak_signal_count >= 2                     ~ "Low",
-      sig_residential                            ~ "Medium",
-      TRUE                                       ~ "No Signal"
+      strong_signal_count >= 2 ~ "High",
+      strong_signal_count == 1 ~ "Medium",
+      weak_signal_count >= 2   ~ "Low",
+      sig_residential          ~ "Medium",
+      TRUE                     ~ "No Signal"
     )
   )
 
-# Summarize Zoho classification
 cat("\n--- Zoho Contact Classification Summary ---\n")
 zoho_classified %>%
   count(customer_class, classification_confidence) %>%
   arrange(customer_class, classification_confidence) %>%
   print(n = 20)
 
-# --- 6. Merge BigCommerce Orders with Zoho Classifications -------------------
-
-# Create a Zoho lookup: one row per email (take the one with most signals)
+# One row per email for lookups
 zoho_lookup <- zoho_classified %>%
   filter(!is.na(zoho_email) & zoho_email != "") %>%
   group_by(zoho_email) %>%
@@ -191,48 +167,9 @@ zoho_lookup <- zoho_classified %>%
          zoho_company, zoho_customer_type, zoho_business_type, zoho_trade_status,
          starts_with("sig_"))
 
-# Primary merge: on email
-orders_merged <- bc_clean %>%
-  left_join(zoho_lookup, by = c("match_email" = "zoho_email"))
-
-# For unmatched orders, try to classify from BigCommerce data alone
-orders_merged <- orders_merged %>%
-  mutate(
-    # BigCommerce-only signals
-    bc_has_company = !is.na(shipping_company) & shipping_company != "" &
-      !shipping_company %in% c("n/a", "na", "none", "-"),
-    bc_group_pro = customer_group %in% c(
-      "professional", "commercial", "trade", "wholesale", "dealer",
-      "contractor", "builder", "business"
-    ),
-
-    # Final classification: use Zoho if available, else BigCommerce signals
-    final_class = case_when(
-      !is.na(customer_class) ~ customer_class,
-      bc_has_company | bc_group_pro ~ "Professional",
-      TRUE ~ "Unknown"
-    ),
-
-    # For unknowns, assume Residential per instructions but track them
-    display_class = ifelse(final_class == "Unknown", "Residential (assumed)", final_class),
-
-    # Broad grouping for analysis
-    broad_class = ifelse(final_class == "Professional", "Professional", "Residential")
-  )
-
-cat("\n--- Order Classification Summary ---\n")
-orders_merged %>%
-  count(final_class) %>%
-  mutate(pct = round(n / sum(n) * 100, 1)) %>%
-  print()
-
-cat("\n--- Classification Detail ---\n")
-orders_merged %>%
-  count(display_class) %>%
-  mutate(pct = round(n / sum(n) * 100, 1)) %>%
-  print()
-
-# --- 6b. Integrate Stripe Data (Authoritative Payment Source) ----------------
+# ==========================================================================
+# 6. STRIPE AS AUTHORITY: Build master customer list
+# ==========================================================================
 
 stripe_clean <- stripe_customers %>%
   mutate(
@@ -242,90 +179,121 @@ stripe_clean <- stripe_customers %>%
     stripe_payment_count = as.numeric(`Payment Count`),
     stripe_avg_order = as.numeric(gsub("[^0-9.]", "", `Average Order`)),
     stripe_refunded = as.numeric(gsub("[^0-9.]", "", `Refunded Volume`)),
-    stripe_created = ymd_hms(`Created (UTC)`, quiet = TRUE),
-    stripe_created_year = year(stripe_created)
+    stripe_created = ymd_hms(`Created (UTC)`, quiet = TRUE)
   ) %>%
   filter(!is.na(stripe_email) & stripe_email != "")
 
 cat("\nStripe customers after cleaning:", nrow(stripe_clean), "\n")
 
-# Create Stripe lookup: one row per email (take highest spender if dupes)
-stripe_lookup <- stripe_clean %>%
+# Consolidate to one row per email (Stripe can have duplicates)
+customer_master <- stripe_clean %>%
   group_by(stripe_email) %>%
   summarise(
-    stripe_total_spend = sum(stripe_total_spend, na.rm = TRUE),
-    stripe_payment_count = sum(stripe_payment_count, na.rm = TRUE),
-    stripe_avg_order = mean(stripe_avg_order, na.rm = TRUE),
-    stripe_refunded = sum(stripe_refunded, na.rm = TRUE),
-    stripe_first_created = min(stripe_created, na.rm = TRUE),
+    stripe_name = first(na.omit(stripe_name)),
+    total_spend = sum(stripe_total_spend, na.rm = TRUE),
+    total_orders = sum(stripe_payment_count, na.rm = TRUE),
+    avg_order = ifelse(sum(stripe_payment_count, na.rm = TRUE) > 0,
+                       sum(stripe_total_spend, na.rm = TRUE) / sum(stripe_payment_count, na.rm = TRUE),
+                       0),
+    total_refunded = sum(stripe_refunded, na.rm = TRUE),
+    first_seen = min(stripe_created, na.rm = TRUE),
     .groups = "drop"
-  )
+  ) %>%
+  filter(total_spend > 0) %>%
+  mutate(first_year = year(first_seen))
 
-# Merge Stripe data onto classified orders
-orders_merged <- orders_merged %>%
-  left_join(stripe_lookup, by = c("match_email" = "stripe_email"))
+cat("Stripe paying customers (deduplicated):", nrow(customer_master), "\n")
 
-# --- Data Integrity: Compare BigCommerce vs Stripe coverage ---
-bc_emails <- orders_merged %>%
+# Classify from Zoho
+customer_master <- customer_master %>%
+  left_join(zoho_lookup %>% select(zoho_email, customer_class, classification_confidence,
+                                    pro_signal_count),
+            by = c("stripe_email" = "zoho_email"))
+
+# Enrich from BigCommerce for unmatched
+bc_company_lookup <- bc_clean %>%
   filter(!is.na(match_email)) %>%
-  distinct(match_email) %>%
-  pull()
-
-stripe_emails <- stripe_lookup %>% pull(stripe_email)
-
-bc_only <- setdiff(bc_emails, stripe_emails)
-stripe_only <- setdiff(stripe_emails, bc_emails)
-both <- intersect(bc_emails, stripe_emails)
-
-cat("\n--- Data Coverage: BigCommerce vs Stripe ---\n")
-cat(sprintf("  Customers in both:          %s\n", length(both)))
-cat(sprintf("  BigCommerce only:           %s\n", length(bc_only)))
-cat(sprintf("  Stripe only (not in BC):    %s\n", length(stripe_only)))
-cat(sprintf("  BigCommerce match rate:     %s%%\n",
-            round(length(both) / length(bc_emails) * 100, 1)))
-
-# Stripe-only customers with their classification from Zoho
-stripe_only_classified <- stripe_clean %>%
-  filter(stripe_email %in% stripe_only) %>%
-  left_join(
-    zoho_lookup %>% select(zoho_email, customer_class, classification_confidence),
-    by = c("stripe_email" = "zoho_email")
+  group_by(match_email) %>%
+  summarise(
+    bc_shipping_company = first(na.omit(shipping_company)),
+    bc_customer_group = first(na.omit(customer_group)),
+    .groups = "drop"
   ) %>%
   mutate(
-    final_class = ifelse(is.na(customer_class), "Unknown", customer_class),
+    bc_has_company = !is.na(bc_shipping_company) & bc_shipping_company != "" &
+      !bc_shipping_company %in% c("n/a", "na", "none", "-"),
+    bc_group_pro = bc_customer_group %in% c(
+      "professional", "commercial", "trade", "wholesale", "dealer",
+      "contractor", "builder", "business"
+    )
+  )
+
+customer_master <- customer_master %>%
+  left_join(bc_company_lookup, by = c("stripe_email" = "match_email")) %>%
+  mutate(
+    final_class = case_when(
+      !is.na(customer_class) ~ customer_class,
+      bc_has_company | bc_group_pro ~ "Professional",
+      TRUE ~ "Unknown"
+    ),
+    display_class = case_when(
+      final_class == "Professional" ~ "Professional",
+      final_class == "Residential"  ~ "Residential",
+      TRUE                          ~ "Residential (assumed)"
+    ),
+    broad_class = ifelse(final_class == "Professional", "Professional", "Residential"),
+    is_repeat = total_orders > 1
+  )
+
+# --- Stripe-authoritative summary ---
+cat("\n--- Customer Master Summary (Stripe Authority) ---\n")
+customer_master %>%
+  group_by(broad_class) %>%
+  summarise(
+    customers = n(),
+    revenue = sum(total_spend, na.rm = TRUE),
+    orders = sum(total_orders, na.rm = TRUE),
+    avg_order = round(sum(total_spend) / sum(total_orders), 2),
+    avg_ltv = round(mean(total_spend), 2),
+    repeat_rate = round(sum(is_repeat) / n() * 100, 1),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_customers = round(customers / sum(customers) * 100, 1),
+    pct_revenue = round(revenue / sum(revenue) * 100, 1)
+  ) %>%
+  print()
+
+cat("\n--- Classification Confidence ---\n")
+customer_master %>%
+  count(display_class) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  print()
+
+# ==========================================================================
+# 7. BigCommerce Yearly Trends (partial coverage)
+# ==========================================================================
+
+orders_merged <- bc_clean %>%
+  left_join(zoho_lookup %>% select(zoho_email, customer_class),
+            by = c("match_email" = "zoho_email")) %>%
+  left_join(bc_company_lookup %>% select(match_email, bc_has_company, bc_group_pro),
+            by = c("match_email" = "match_email")) %>%
+  mutate(
+    final_class = case_when(
+      !is.na(customer_class) ~ customer_class,
+      bc_has_company | bc_group_pro ~ "Professional",
+      TRUE ~ "Unknown"
+    ),
+    display_class = case_when(
+      final_class == "Professional" ~ "Professional",
+      final_class == "Residential"  ~ "Residential",
+      TRUE                          ~ "Residential (assumed)"
+    ),
     broad_class = ifelse(final_class == "Professional", "Professional", "Residential")
   )
 
-cat(sprintf("\n  Stripe-only total spend:    %s\n",
-            dollar(sum(stripe_only_classified$stripe_total_spend, na.rm = TRUE))))
-cat(sprintf("  Stripe-only total orders:   %s\n",
-            sum(stripe_only_classified$stripe_payment_count, na.rm = TRUE)))
-
-# Revenue comparison at customer level
-revenue_comparison <- orders_merged %>%
-  filter(!is.na(match_email) & !is.na(stripe_total_spend)) %>%
-  group_by(match_email) %>%
-  summarise(
-    bc_revenue = sum(order_total, na.rm = TRUE),
-    stripe_revenue = first(stripe_total_spend),
-    .groups = "drop"
-  ) %>%
-  summarise(
-    customers = n(),
-    total_bc_revenue = sum(bc_revenue),
-    total_stripe_revenue = sum(stripe_revenue),
-    bc_capture_rate = round(total_bc_revenue / total_stripe_revenue * 100, 1)
-  )
-
-cat("\n--- Revenue Integrity Check (matched customers) ---\n")
-cat(sprintf("  BigCommerce revenue:        %s\n", dollar(revenue_comparison$total_bc_revenue)))
-cat(sprintf("  Stripe revenue:             %s\n", dollar(revenue_comparison$total_stripe_revenue)))
-cat(sprintf("  BC capture rate:            %s%%\n", revenue_comparison$bc_capture_rate))
-
-# --- 7. Analysis by Customer Type & Year -------------------------------------
-
-# 7a. Summary table
-analysis_summary <- orders_merged %>%
+yearly_summary <- orders_merged %>%
   group_by(order_year, broad_class) %>%
   summarise(
     order_count = n(),
@@ -334,10 +302,7 @@ analysis_summary <- orders_merged %>%
     median_order_size = median(order_total, na.rm = TRUE),
     unique_customers = n_distinct(match_email, na.rm = TRUE),
     .groups = "drop"
-  )
-
-# Add percentages within each year
-analysis_summary <- analysis_summary %>%
+  ) %>%
   group_by(order_year) %>%
   mutate(
     pct_orders = round(order_count / sum(order_count) * 100, 1),
@@ -345,316 +310,95 @@ analysis_summary <- analysis_summary %>%
   ) %>%
   ungroup()
 
-cat("\n--- Analysis Summary by Year and Customer Type ---\n")
-print(analysis_summary, n = 20)
+cat("\n--- Yearly Summary (BigCommerce, partial coverage) ---\n")
+print(yearly_summary, n = 20)
 
-# 7b. Repeat rate analysis
-repeat_analysis <- orders_merged %>%
-  group_by(broad_class, match_email) %>%
-  summarise(
-    order_count = n(),
-    total_spent = sum(order_total, na.rm = TRUE),
-    first_order = min(order_date, na.rm = TRUE),
-    last_order = max(order_date, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(!is.na(match_email)) %>%
-  mutate(is_repeat = order_count > 1)
-
-repeat_summary <- repeat_analysis %>%
-  group_by(broad_class) %>%
-  summarise(
-    total_customers = n(),
-    repeat_customers = sum(is_repeat),
-    repeat_rate = round(repeat_customers / total_customers * 100, 1),
-    avg_orders_per_customer = round(mean(order_count), 2),
-    avg_ltv = round(mean(total_spent), 2),
-    .groups = "drop"
-  )
-
-cat("\n--- Repeat Rate by Customer Type ---\n")
-print(repeat_summary)
-
-# Repeat rate by year (based on whether they've ordered before that year)
 repeat_by_year <- orders_merged %>%
   filter(!is.na(match_email)) %>%
   arrange(match_email, order_date) %>%
   group_by(match_email) %>%
-  mutate(
-    cumulative_order_num = row_number(),
-    is_repeat_order = cumulative_order_num > 1
-  ) %>%
+  mutate(cumulative_order_num = row_number(), is_repeat_order = cumulative_order_num > 1) %>%
   ungroup() %>%
   group_by(order_year, broad_class) %>%
-  summarise(
-    total_orders = n(),
-    repeat_orders = sum(is_repeat_order),
-    repeat_order_rate = round(repeat_orders / total_orders * 100, 1),
-    .groups = "drop"
-  )
+  summarise(total_orders = n(), repeat_orders = sum(is_repeat_order),
+            repeat_order_rate = round(repeat_orders / total_orders * 100, 1),
+            .groups = "drop")
 
-cat("\n--- Repeat Order Rate by Year and Customer Type ---\n")
+cat("\n--- Repeat Order Rate by Year ---\n")
 print(repeat_by_year, n = 20)
 
-# 7c. Certainty analysis (how many have no signal at all)
-certainty_summary <- orders_merged %>%
-  group_by(order_year) %>%
-  summarise(
-    total = n(),
-    classified_pro = sum(final_class == "Professional"),
-    classified_res = sum(final_class == "Residential"),
-    no_signal = sum(final_class == "Unknown"),
-    pct_no_signal = round(no_signal / total * 100, 1),
-    matched_to_zoho = sum(!is.na(customer_class)),
-    pct_matched = round(matched_to_zoho / total * 100, 1),
-    .groups = "drop"
-  )
+# ==========================================================================
+# 8. Data Coverage
+# ==========================================================================
 
-cat("\n--- Classification Certainty by Year ---\n")
-print(certainty_summary)
+zoho_emails <- zoho_lookup %>% pull(zoho_email)
+bc_emails <- bc_clean %>% filter(!is.na(match_email)) %>% distinct(match_email) %>% pull()
+stripe_paying <- customer_master %>% pull(stripe_email)
 
-# --- 8. Visualizations (Buyer-Ready) -----------------------------------------
+cat("\n--- Data Source Coverage ---\n")
+cat(sprintf("  Stripe paying customers:          %s\n", comma(length(stripe_paying))))
+cat(sprintf("  Matched to Zoho CRM:              %s (%s%%)\n",
+            comma(sum(stripe_paying %in% zoho_emails)),
+            round(sum(stripe_paying %in% zoho_emails) / length(stripe_paying) * 100, 1)))
+cat(sprintf("  Matched to BigCommerce:            %s (%s%%)\n",
+            comma(sum(stripe_paying %in% bc_emails)),
+            round(sum(stripe_paying %in% bc_emails) / length(stripe_paying) * 100, 1)))
+cat(sprintf("  With any classification signal:    %s (%s%%)\n",
+            comma(sum(customer_master$final_class != "Unknown")),
+            round(sum(customer_master$final_class != "Unknown") / nrow(customer_master) * 100, 1)))
+cat(sprintf("  No signal (assumed Residential):   %s (%s%%)\n",
+            comma(sum(customer_master$final_class == "Unknown")),
+            round(sum(customer_master$final_class == "Unknown") / nrow(customer_master) * 100, 1)))
 
-# Theme for clean, professional charts
-theme_buyer <- theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", size = 16),
-    plot.subtitle = element_text(color = "gray40", size = 12),
-    legend.position = "bottom",
-    panel.grid.minor = element_blank()
-  )
+# ==========================================================================
+# 9. Executive Summary
+# ==========================================================================
 
-# Color palette
-colors_class <- c("Professional" = "#2C5F8A", "Residential" = "#E8894A")
-colors_detail <- c("Professional" = "#2C5F8A", "Residential" = "#E8894A",
-                    "Residential (assumed)" = "#F5C285")
-
-# --- Plot 1: Order Count by Customer Type & Year ---
-p1 <- analysis_summary %>%
-  ggplot(aes(x = factor(order_year), y = order_count, fill = broad_class)) +
-  geom_col(position = "dodge", width = 0.7) +
-  geom_text(aes(label = comma(order_count)),
-            position = position_dodge(width = 0.7), vjust = -0.5, size = 4) +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Number of Orders by Customer Type",
-    subtitle = "2023 - 2025",
-    x = "Year", y = "Order Count", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- Plot 2: Revenue by Customer Type & Year ---
-p2 <- analysis_summary %>%
-  ggplot(aes(x = factor(order_year), y = total_revenue, fill = broad_class)) +
-  geom_col(position = "dodge", width = 0.7) +
-  geom_text(aes(label = dollar(total_revenue, accuracy = 1)),
-            position = position_dodge(width = 0.7), vjust = -0.5, size = 3.5) +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Revenue by Customer Type",
-    subtitle = "2023 - 2025",
-    x = "Year", y = "Total Revenue", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- Plot 3: Revenue Share (Stacked %) ---
-p3 <- analysis_summary %>%
-  ggplot(aes(x = factor(order_year), y = pct_revenue, fill = broad_class)) +
-  geom_col(width = 0.6) +
-  geom_text(aes(label = paste0(pct_revenue, "%")),
-            position = position_stack(vjust = 0.5), size = 5, color = "white",
-            fontface = "bold") +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = function(x) paste0(x, "%")) +
-  labs(
-    title = "Revenue Share by Customer Type",
-    subtitle = "2023 - 2025",
-    x = "Year", y = "% of Revenue", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- Plot 4: Average Order Size ---
-p4 <- analysis_summary %>%
-  ggplot(aes(x = factor(order_year), y = avg_order_size, fill = broad_class)) +
-  geom_col(position = "dodge", width = 0.7) +
-  geom_text(aes(label = dollar(avg_order_size, accuracy = 1)),
-            position = position_dodge(width = 0.7), vjust = -0.5, size = 4) +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Average Order Size by Customer Type",
-    subtitle = "2023 - 2025",
-    x = "Year", y = "Avg Order Size", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- Plot 5: Repeat Rate ---
-p5 <- repeat_summary %>%
-  ggplot(aes(x = broad_class, y = repeat_rate, fill = broad_class)) +
-  geom_col(width = 0.5) +
-  geom_text(aes(label = paste0(repeat_rate, "%")), vjust = -0.5, size = 5,
-            fontface = "bold") +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = function(x) paste0(x, "%"),
-                     expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Repeat Customer Rate",
-    subtitle = "Customers with 2+ orders (2023-2025)",
-    x = "", y = "Repeat Rate", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- Plot 6: Customer LTV ---
-p6 <- repeat_summary %>%
-  ggplot(aes(x = broad_class, y = avg_ltv, fill = broad_class)) +
-  geom_col(width = 0.5) +
-  geom_text(aes(label = dollar(avg_ltv, accuracy = 1)), vjust = -0.5, size = 5,
-            fontface = "bold") +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Average Customer Lifetime Value",
-    subtitle = "Total spend per customer (2023-2025)",
-    x = "", y = "Avg LTV", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- Plot 7: Classification Certainty ---
-certainty_long <- orders_merged %>%
-  count(order_year, display_class) %>%
-  group_by(order_year) %>%
-  mutate(pct = round(n / sum(n) * 100, 1)) %>%
-  ungroup()
-
-p7 <- certainty_long %>%
-  ggplot(aes(x = factor(order_year), y = n, fill = display_class)) +
-  geom_col(width = 0.6) +
-  geom_text(aes(label = paste0(pct, "%")),
-            position = position_stack(vjust = 0.5), size = 4, color = "white",
-            fontface = "bold") +
-  scale_fill_manual(values = colors_detail) +
-  scale_y_continuous(labels = comma) +
-  labs(
-    title = "Classification Breakdown with Confidence",
-    subtitle = "Shows assumed-residential orders (no signals) separately",
-    x = "Year", y = "Order Count", fill = ""
-  ) +
-  theme_buyer
-
-# --- Plot 8: Repeat Rate by Year ---
-p8 <- repeat_by_year %>%
-  ggplot(aes(x = factor(order_year), y = repeat_order_rate, fill = broad_class)) +
-  geom_col(position = "dodge", width = 0.7) +
-  geom_text(aes(label = paste0(repeat_order_rate, "%")),
-            position = position_dodge(width = 0.7), vjust = -0.5, size = 4) +
-  scale_fill_manual(values = colors_class) +
-  scale_y_continuous(labels = function(x) paste0(x, "%"),
-                     expand = expansion(mult = c(0, 0.15))) +
-  labs(
-    title = "Repeat Order Rate by Year",
-    subtitle = "% of orders from returning customers",
-    x = "Year", y = "Repeat Order %", fill = "Customer Type"
-  ) +
-  theme_buyer
-
-# --- 9. Save All Plots -------------------------------------------------------
-
-ggsave("plot_01_order_count.png", p1, width = 10, height = 6, dpi = 150)
-ggsave("plot_02_revenue.png", p2, width = 10, height = 6, dpi = 150)
-ggsave("plot_03_revenue_share.png", p3, width = 10, height = 6, dpi = 150)
-ggsave("plot_04_avg_order_size.png", p4, width = 10, height = 6, dpi = 150)
-ggsave("plot_05_repeat_rate.png", p5, width = 8, height = 6, dpi = 150)
-ggsave("plot_06_customer_ltv.png", p6, width = 8, height = 6, dpi = 150)
-ggsave("plot_07_classification_confidence.png", p7, width = 10, height = 6, dpi = 150)
-ggsave("plot_08_repeat_rate_by_year.png", p8, width = 10, height = 6, dpi = 150)
-
-cat("\nAll plots saved to working directory.\n")
-
-# --- 10. Export Summary Tables ------------------------------------------------
-
-write_csv(analysis_summary, "summary_by_year_and_type.csv")
-write_csv(repeat_summary, "repeat_rate_summary.csv")
-write_csv(repeat_by_year, "repeat_rate_by_year.csv")
-write_csv(certainty_summary, "classification_certainty.csv")
-
-# Export the full merged order-level data for further analysis
-orders_export <- orders_merged %>%
-  select(
-    `Order ID`, order_date, order_year, order_total,
-    customer_name = `Customer Name`, match_email,
-    shipping_company, billing_company, customer_group,
-    final_class, display_class, broad_class,
-    pro_signal_count, classification_confidence,
-    # Zoho signals
-    zoho_customer_type, zoho_business_type, zoho_trade_status,
-    starts_with("sig_"),
-    # Stripe data
-    stripe_total_spend, stripe_payment_count, stripe_avg_order, stripe_refunded
-  )
-
-# Export Stripe-only customers (not in BigCommerce) for review
-write_csv(stripe_only_classified, "stripe_only_customers.csv")
-
-write_csv(orders_export, "orders_classified.csv")
-
-cat("Summary tables and classified orders exported.\n")
-
-# --- 11. Print Final Executive Summary ---------------------------------------
+total_customers <- nrow(customer_master)
+total_revenue <- sum(customer_master$total_spend, na.rm = TRUE)
+total_orders_all <- sum(customer_master$total_orders, na.rm = TRUE)
 
 cat("\n")
 cat("=============================================================\n")
-cat("       EXECUTIVE SUMMARY: Customer Type Analysis\n")
+cat("       EXECUTIVE SUMMARY (Stripe-Authoritative)\n")
 cat("=============================================================\n\n")
 
-total_orders <- nrow(orders_merged)
-total_revenue <- sum(orders_merged$order_total, na.rm = TRUE)
+cat(sprintf("Total Paying Customers: %s\n", comma(total_customers)))
+cat(sprintf("Total Revenue: %s\n", dollar(total_revenue)))
+cat(sprintf("Total Orders: %s\n\n", comma(total_orders_all)))
 
-cat(sprintf("Total Orders (2023-2025): %s\n", comma(total_orders)))
-cat(sprintf("Total Revenue (2023-2025): %s\n\n", dollar(total_revenue)))
-
-exec_summary <- orders_merged %>%
+type_summary <- customer_master %>%
   group_by(broad_class) %>%
   summarise(
-    orders = n(),
-    revenue = sum(order_total, na.rm = TRUE),
+    customers = n(), revenue = sum(total_spend, na.rm = TRUE),
+    orders = sum(total_orders, na.rm = TRUE),
+    avg_ltv = round(mean(total_spend), 2),
+    repeat_rate = round(sum(is_repeat) / n() * 100, 1),
     .groups = "drop"
   ) %>%
-  mutate(
-    pct_orders = round(orders / sum(orders) * 100, 1),
-    pct_revenue = round(revenue / sum(revenue) * 100, 1)
-  )
+  mutate(pct_cust = round(customers / sum(customers) * 100, 1),
+         pct_rev = round(revenue / sum(revenue) * 100, 1))
 
-for (i in 1:nrow(exec_summary)) {
-  cat(sprintf("%s:\n", exec_summary$broad_class[i]))
-  cat(sprintf("  Orders: %s (%s%%)\n",
-              comma(exec_summary$orders[i]), exec_summary$pct_orders[i]))
-  cat(sprintf("  Revenue: %s (%s%%)\n\n",
-              dollar(exec_summary$revenue[i]), exec_summary$pct_revenue[i]))
+for (i in 1:nrow(type_summary)) {
+  cat(sprintf("%s:\n", type_summary$broad_class[i]))
+  cat(sprintf("  Customers: %s (%s%%)\n", comma(type_summary$customers[i]), type_summary$pct_cust[i]))
+  cat(sprintf("  Revenue:   %s (%s%%)\n", dollar(type_summary$revenue[i]), type_summary$pct_rev[i]))
+  cat(sprintf("  Orders:    %s\n", comma(type_summary$orders[i])))
+  cat(sprintf("  Avg LTV:   %s\n", dollar(type_summary$avg_ltv[i])))
+  cat(sprintf("  Repeat:    %s%%\n\n", type_summary$repeat_rate[i]))
 }
 
-no_signal_pct <- round(sum(orders_merged$final_class == "Unknown") / total_orders * 100, 1)
-cat(sprintf("Classification Certainty: %s%% of orders had no signal\n", no_signal_pct))
-cat("(These are assumed Residential in the analysis above)\n\n")
-
-cat("Repeat Customer Rates:\n")
-for (i in 1:nrow(repeat_summary)) {
-  cat(sprintf("  %s: %s%% (%s avg orders/customer, %s avg LTV)\n",
-              repeat_summary$broad_class[i],
-              repeat_summary$repeat_rate[i],
-              repeat_summary$avg_orders_per_customer[i],
-              dollar(repeat_summary$avg_ltv[i])))
-}
-
-cat("\nStripe Payment Integrity:\n")
-stripe_total_rev <- sum(stripe_lookup$stripe_total_spend, na.rm = TRUE)
-stripe_total_orders <- sum(stripe_lookup$stripe_payment_count, na.rm = TRUE)
-cat(sprintf("  Total Stripe revenue (all time): %s\n", dollar(stripe_total_rev)))
-cat(sprintf("  Total Stripe transactions:       %s\n", comma(stripe_total_orders)))
-cat(sprintf("  Stripe customers:                %s\n", comma(nrow(stripe_lookup))))
-cat(sprintf("  Stripe-only (not in BC export):  %s customers, %s revenue\n",
-            comma(length(stripe_only)),
-            dollar(sum(stripe_only_classified$stripe_total_spend, na.rm = TRUE))))
-cat(sprintf("  BC capture rate vs Stripe:       %s%%\n", revenue_comparison$bc_capture_rate))
+no_signal_pct <- round(sum(customer_master$final_class == "Unknown") / total_customers * 100, 1)
+cat(sprintf("Classification Certainty: %s%% of customers had no signal\n", no_signal_pct))
+cat("(These are assumed Residential in the analysis above)\n")
 cat("\n=============================================================\n")
+
+# ==========================================================================
+# 10. Export
+# ==========================================================================
+
+write_csv(customer_master, "customer_master_classified.csv")
+write_csv(yearly_summary, "yearly_summary_bc.csv")
+write_csv(repeat_by_year, "repeat_rate_by_year.csv")
+
+cat("\nExports saved.\n")
