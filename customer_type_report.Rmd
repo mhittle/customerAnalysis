@@ -577,11 +577,12 @@ colors_detail <- c("Professional" = "#2C5F8A", "Residential" = "#E8894A",
 
 ```{r period-revenue}
 # Calculate 2023-2025 period-specific revenue from BigCommerce
-bc_period_revenue <- sum(order_detail$order_total, na.rm = TRUE)
-bc_period_orders <- nrow(order_detail)
+# orders_merged is already built from bc_clean + classification joins
+bc_period_revenue <- sum(orders_merged$order_total, na.rm = TRUE)
+bc_period_orders <- nrow(orders_merged)
 
 # Period-specific by type from BC
-period_by_type <- order_detail %>%
+period_by_type <- orders_merged %>%
   group_by(broad_class) %>%
   summarise(
     period_revenue = sum(order_total, na.rm = TRUE),
