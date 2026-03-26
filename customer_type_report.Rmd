@@ -34,6 +34,7 @@ library(knitr)
 ```{r load-data}
 bc_orders <- read_csv("orders-2026-03-25.csv", show_col_types = FALSE)
 zoho_contacts <- read_csv("Contacts_2026_03_25.csv", show_col_types = FALSE)
+zoho_accounts <- read_csv("Accounts_2025_03_25.csv", show_col_types = FALSE)
 stripe_customers <- read_csv("stripe_unified_customers.csv", show_col_types = FALSE)
 ```
 
@@ -190,6 +191,60 @@ zoho_lookup <- zoho_classified %>%
          starts_with("sig_"))
 ```
 
+```{r accounts-and-address-signals}
+# Zoho Accounts: additional classification source
+acct_classified <- zoho_accounts %>%
+  mutate(
+    acct_email = tolower(trimws(ifelse("Email 1" %in% names(.), `Email 1`, NA_character_))),
+    acct_customer_type = tolower(trimws(`Customer Type`)),
+    acct_business_type = tolower(trimws(`Business Type`)),
+    acct_contact_type = tolower(trimws(`Contact Type`)),
+    acct_trade_interest = tolower(trimws(`Trade Program Interest`)),
+    acct_trade_program = tolower(trimws(`Trade Program`)),
+    acct_projects_per_year = tolower(trimws(`Projects per Year`)),
+    acct_disaster_recovery = tolower(trimws(`Disaster Recovery?`)),
+    acct_account_type = tolower(trimws(`Account Type`)),
+    acct_industry = tolower(trimws(Industry))
+  ) %>%
+  mutate(
+    acct_is_pro = acct_customer_type %in% c("professional","commercial","contractor","builder",
+      "designer","architect","trade","dealer","wholesale","business") |
+      (!is.na(acct_business_type) & acct_business_type != "" &
+       !acct_business_type %in% c("homeowner","residential")) |
+      acct_contact_type %in% c("professional","commercial","contractor","trade","dealer","business") |
+      (!is.na(acct_trade_interest) & acct_trade_interest != "" &
+       !acct_trade_interest %in% c("no","none","n/a")) |
+      (!is.na(acct_trade_program) & acct_trade_program == "true") |
+      (!is.na(acct_projects_per_year) & acct_projects_per_year != "") |
+      (!is.na(acct_disaster_recovery) & acct_disaster_recovery != "" & acct_disaster_recovery != "no") |
+      (!is.na(acct_industry) & acct_industry != "") |
+      (!is.na(acct_account_type) & acct_account_type != "" &
+       !acct_account_type %in% c("customer","other",""))
+  )
+
+acct_lookup <- acct_classified %>%
+  filter(!is.na(acct_email) & acct_email != "" & acct_is_pro) %>%
+  distinct(acct_email) %>% mutate(acct_is_professional = TRUE)
+
+# BigCommerce: different shipping vs billing name+address = professional
+bc_address_signal <- bc_clean %>%
+  filter(!is.na(match_email)) %>%
+  mutate(
+    ship_name = tolower(trimws(`Shipping Name`)),
+    bill_name = tolower(trimws(`Billing Name`)),
+    ship_addr = tolower(trimws(paste(`Shipping Street 1`, `Shipping Suburb`,
+                                      `Shipping State`, `Shipping Zip`))),
+    bill_addr = tolower(trimws(paste(`Billing Street 1`, `Billing Suburb`,
+                                      `Billing State`, `Billing Zip`))),
+    diff_name_and_addr = !is.na(ship_name) & !is.na(bill_name) & ship_name != "" &
+      bill_name != "" & ship_name != bill_name &
+      !is.na(ship_addr) & !is.na(bill_addr) & ship_addr != bill_addr
+  ) %>%
+  group_by(match_email) %>%
+  summarise(has_diff_ship_bill = any(diff_name_and_addr, na.rm = TRUE), .groups = "drop") %>%
+  filter(has_diff_ship_bill)
+```
+
 ```{r stripe-master}
 # ==========================================================================
 # STRIPE AS AUTHORITY: Build the master customer list from Stripe
@@ -264,11 +319,17 @@ bc_company_lookup <- bc_clean %>%
 
 customer_master <- customer_master %>%
   left_join(bc_company_lookup, by = c("stripe_email" = "match_email")) %>%
+  left_join(acct_lookup, by = c("stripe_email" = "acct_email")) %>%
+  left_join(bc_address_signal, by = c("stripe_email" = "match_email")) %>%
   mutate(
+    acct_is_professional = ifelse(is.na(acct_is_professional), FALSE, acct_is_professional),
+    has_diff_ship_bill = ifelse(is.na(has_diff_ship_bill), FALSE, has_diff_ship_bill),
     # Professional always wins
     final_class = case_when(
       customer_class == "Professional"       ~ "Professional",
+      acct_is_professional                   ~ "Professional",
       bc_has_company | bc_group_pro          ~ "Professional",
+      has_diff_ship_bill                     ~ "Professional",
       customer_class == "Residential"        ~ "Residential",
       TRUE                                   ~ "Unknown"
     ),
@@ -289,11 +350,17 @@ orders_merged <- bc_clean %>%
             by = c("match_email" = "zoho_email")) %>%
   left_join(bc_company_lookup %>% select(match_email, bc_has_company, bc_group_pro),
             by = c("match_email" = "match_email")) %>%
+  left_join(acct_lookup, by = c("match_email" = "acct_email")) %>%
+  left_join(bc_address_signal, by = c("match_email" = "match_email")) %>%
   mutate(
+    acct_is_professional = ifelse(is.na(acct_is_professional), FALSE, acct_is_professional),
+    has_diff_ship_bill = ifelse(is.na(has_diff_ship_bill), FALSE, has_diff_ship_bill),
     # Professional always wins
     final_class = case_when(
       customer_class == "Professional"       ~ "Professional",
+      acct_is_professional                   ~ "Professional",
       bc_has_company | bc_group_pro          ~ "Professional",
+      has_diff_ship_bill                     ~ "Professional",
       customer_class == "Residential"        ~ "Residential",
       TRUE                                   ~ "Unknown"
     ),
