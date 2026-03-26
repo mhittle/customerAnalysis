@@ -1472,10 +1472,8 @@ repeat_gaps <- customer_cohorts %>%
     days_between = as.numeric(difftime(order_date, prev_order_date, units = "days"))
   ) %>%
   filter(!is.na(days_between)) %>%
-  ungroup() %>%
-  left_join(customer_master %>% select(stripe_email, broad_class),
-            by = c("match_email" = "stripe_email")) %>%
-  mutate(broad_class = ifelse(is.na(broad_class), "Residential", broad_class))
+  ungroup()
+# broad_class is already on customer_cohorts from order_detail
 
 gap_summary <- repeat_gaps %>%
   group_by(broad_class) %>%
