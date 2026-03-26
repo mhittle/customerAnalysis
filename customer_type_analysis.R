@@ -88,15 +88,24 @@ personal_email_domains <- c(
   "zoho.com", "fastmail.com", "hushmail.com", "inbox.com", "gmx.com"
 )
 
+## Junk values commonly found in Zoho Account Name field
+company_junk <- c(
+  "", "n/a", "na", "none", "no", "self", "retired", "home", "homeowner",
+  "yes", "kitchen", "bath", "bathroom", "bathroom remodel", "cabinet doors",
+  "stock cabinets", "custom cabinets", "cabinets", "google", "bigcommerce",
+  "reflectiz bigcommerce", "facebook", "instagram"
+)
+
 zoho_classified <- zoho_clean %>%
   mutate(
     email_domain = str_extract(zoho_email, "(?<=@)[^@]+$"),
     has_business_email = !is.na(email_domain) & !(email_domain %in% personal_email_domains),
 
-    # Professional signal flags
+    # --- STRONG signals (each one alone = Professional) ---
     sig_customer_type = zoho_customer_type %in% c(
       "professional", "commercial", "contractor", "builder", "designer",
-      "architect", "trade", "dealer", "wholesale", "business", "other"
+      "architect", "trade", "dealer", "wholesale", "business"
+      # "other" excluded — too ambiguous
     ),
     sig_business_type = !is.na(zoho_business_type) & zoho_business_type != "" &
       zoho_business_type != "homeowner" & zoho_business_type != "residential",
@@ -113,33 +122,49 @@ zoho_classified <- zoho_clean %>%
     sig_business_id = !is.na(zoho_business_id) & zoho_business_id != "",
     sig_business_entity = !is.na(zoho_business_entity) & zoho_business_entity != "",
     sig_tax_exempt = !is.na(zoho_tax_exempt) & zoho_tax_exempt %in% c("yes", "true", "y"),
-    sig_company = !is.na(zoho_company) & zoho_company != "",
-    sig_email = has_business_email,
+
+    # --- WEAK signals (only count when combined with another signal) ---
+    # Company name: filter out junk values and personal names (first+last match)
+    sig_company_raw = !is.na(zoho_company) &
+      !(zoho_company %in% company_junk) &
+      !(zoho_company == tolower(paste(zoho_first_name, zoho_last_name))) &
+      !(zoho_company == tolower(zoho_last_name)),
+    sig_email_raw = has_business_email,
 
     # Explicit residential signals
     sig_residential = zoho_customer_type %in% c("homeowner", "residential") |
       zoho_business_type %in% c("homeowner", "residential") |
       zoho_contact_type %in% c("homeowner", "residential"),
 
-    # Count professional signals
-    pro_signal_count = sig_customer_type + sig_business_type + sig_contact_type +
+    # Count STRONG professional signals
+    strong_signal_count = sig_customer_type + sig_business_type + sig_contact_type +
       sig_trade_status + sig_trade_interest + sig_professional_type +
-      sig_business_id + sig_business_entity + sig_tax_exempt +
-      sig_company + sig_email,
+      sig_business_id + sig_business_entity + sig_tax_exempt,
 
-    # Classification: sensitive to professional (any signal = professional)
+    # Count WEAK signals
+    weak_signal_count = sig_company_raw + sig_email_raw,
+
+    # Total for reference
+    pro_signal_count = strong_signal_count + weak_signal_count,
+
+    # Classification logic:
+    # - Any strong signal = Professional
+    # - Two weak signals together (company + business email) = Professional
+    # - One weak signal alone = not enough
+    is_professional = (strong_signal_count >= 1) | (weak_signal_count >= 2),
+
     customer_class = case_when(
-      pro_signal_count >= 1 & !sig_residential ~ "Professional",
-      sig_residential & pro_signal_count == 0   ~ "Residential",
-      sig_residential & pro_signal_count >= 1   ~ "Professional",  # pro signals override
-      TRUE                                       ~ "Unknown"
+      is_professional & !sig_residential  ~ "Professional",
+      is_professional & sig_residential   ~ "Professional",  # pro signals override
+      sig_residential                     ~ "Residential",
+      TRUE                                ~ "Unknown"
     ),
 
     # Confidence level
     classification_confidence = case_when(
-      pro_signal_count >= 3                      ~ "High",
-      pro_signal_count == 2                      ~ "Medium",
-      pro_signal_count == 1                      ~ "Low",
+      strong_signal_count >= 2                   ~ "High",
+      strong_signal_count == 1                   ~ "Medium",
+      weak_signal_count >= 2                     ~ "Low",
       sig_residential                            ~ "Medium",
       TRUE                                       ~ "No Signal"
     )
