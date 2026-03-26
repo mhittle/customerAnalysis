@@ -74,6 +74,7 @@ zoho_clean <- zoho_contacts %>%
       "proProjectType" %in% names(.), `proProjectType`, NA_character_
     ))),
     zoho_projects_per_year = tolower(trimws(`Projects per Year`)),
+    zoho_disaster_recovery = tolower(trimws(`Disaster Recovery?`)),
     zoho_business_id = trimws(`Business ID`),
     zoho_business_entity = trimws(`Business Entity`),
     zoho_tax_exempt = tolower(trimws(`Tax Exempt?`)),
@@ -128,21 +129,23 @@ zoho_classified <- zoho_clean %>%
       zoho_professional_type != "" & zoho_professional_type != "homeowner",
     sig_business_id = !is.na(zoho_business_id) & zoho_business_id != "",
     sig_business_entity = !is.na(zoho_business_entity) & zoho_business_entity != "",
-    sig_tax_exempt = !is.na(zoho_tax_exempt) & zoho_tax_exempt %in% c("yes", "true", "y"),
+    # Tax Exempt — any entry counts
+    sig_tax_exempt = !is.na(zoho_tax_exempt) & zoho_tax_exempt != "",
     # customerType metadata field (separate from Customer Type)
     sig_customer_type_meta = !is.na(zoho_customer_type_meta) &
       zoho_customer_type_meta %in% c("professional", "both"),
-    # tradeProgramInterest metadata (separate from Trade Program Interest)
+    # tradeProgramInterest metadata — any entry counts
     sig_trade_interest_meta = !is.na(zoho_trade_interest_meta) &
-      zoho_trade_interest_meta %in% c("yes", "yes!"),
-    # professionalType has actual values (remodeler, home builder, etc.)
-    # Already handled by sig_professional_type above
+      zoho_trade_interest_meta != "",
     # proProjectType — any value set indicates professional context
     sig_pro_project_type = !is.na(zoho_pro_project_type) &
       zoho_pro_project_type != "",
     # Projects per Year — any value indicates professional volume
     sig_projects_per_year = !is.na(zoho_projects_per_year) &
       zoho_projects_per_year != "",
+    # Disaster Recovery — any entry counts
+    sig_disaster_recovery = !is.na(zoho_disaster_recovery) &
+      zoho_disaster_recovery != "" & zoho_disaster_recovery != "no",
 
     # WEAK signals (need 2+ together)
     sig_company_raw = !is.na(zoho_company) &
@@ -161,7 +164,7 @@ zoho_classified <- zoho_clean %>%
       sig_trade_status + sig_trade_interest + sig_trade_program +
       sig_professional_type + sig_business_id + sig_business_entity +
       sig_tax_exempt + sig_customer_type_meta + sig_trade_interest_meta +
-      sig_pro_project_type + sig_projects_per_year,
+      sig_pro_project_type + sig_projects_per_year + sig_disaster_recovery,
     weak_signal_count = sig_company_raw + sig_email_raw,
     pro_signal_count = strong_signal_count + weak_signal_count,
     is_professional = (strong_signal_count >= 1) | (weak_signal_count >= 2),
@@ -259,17 +262,25 @@ customer_master <- customer_master %>%
             by = c("stripe_email" = "zoho_email"))
 
 # Enrich from BigCommerce for unmatched
+# Three places in BC that can indicate professional:
+# 1. Shipping Company
+# 2. Billing Company
+# 3. Customer Group Name
 bc_company_lookup <- bc_clean %>%
   filter(!is.na(match_email)) %>%
   group_by(match_email) %>%
   summarise(
     bc_shipping_company = first(na.omit(shipping_company)),
+    bc_billing_company = first(na.omit(billing_company)),
     bc_customer_group = first(na.omit(customer_group)),
     .groups = "drop"
   ) %>%
   mutate(
-    bc_has_company = !is.na(bc_shipping_company) & bc_shipping_company != "" &
+    bc_has_shipping_co = !is.na(bc_shipping_company) & bc_shipping_company != "" &
       !bc_shipping_company %in% c("n/a", "na", "none", "-"),
+    bc_has_billing_co = !is.na(bc_billing_company) & bc_billing_company != "" &
+      !bc_billing_company %in% c("n/a", "na", "none", "-"),
+    bc_has_company = bc_has_shipping_co | bc_has_billing_co,
     bc_group_pro = bc_customer_group %in% c(
       "professional", "commercial", "trade", "wholesale", "dealer",
       "contractor", "builder", "business"
@@ -279,10 +290,12 @@ bc_company_lookup <- bc_clean %>%
 customer_master <- customer_master %>%
   left_join(bc_company_lookup, by = c("stripe_email" = "match_email")) %>%
   mutate(
+    # Professional always wins: if ANY source says pro, they're pro
     final_class = case_when(
-      !is.na(customer_class) ~ customer_class,
-      bc_has_company | bc_group_pro ~ "Professional",
-      TRUE ~ "Unknown"
+      customer_class == "Professional"       ~ "Professional",
+      bc_has_company | bc_group_pro          ~ "Professional",
+      customer_class == "Residential"        ~ "Residential",
+      TRUE                                   ~ "Unknown"
     ),
     display_class = case_when(
       final_class == "Professional" ~ "Professional",
@@ -328,10 +341,12 @@ orders_merged <- bc_clean %>%
   left_join(bc_company_lookup %>% select(match_email, bc_has_company, bc_group_pro),
             by = c("match_email" = "match_email")) %>%
   mutate(
+    # Professional always wins
     final_class = case_when(
-      !is.na(customer_class) ~ customer_class,
-      bc_has_company | bc_group_pro ~ "Professional",
-      TRUE ~ "Unknown"
+      customer_class == "Professional"       ~ "Professional",
+      bc_has_company | bc_group_pro          ~ "Professional",
+      customer_class == "Residential"        ~ "Residential",
+      TRUE                                   ~ "Unknown"
     ),
     display_class = case_when(
       final_class == "Professional" ~ "Professional",
