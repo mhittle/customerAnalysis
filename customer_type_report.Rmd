@@ -902,9 +902,10 @@ order_detail <- bc_clean %>%
     order_quarter = floor_date(order_date, "quarter"),
     bc_match_name = tolower(trimws(customer_name))
   ) %>%
-  left_join(customer_master %>% select(stripe_email, broad_class, final_class),
+  left_join(customer_master %>% select(stripe_email, cm_broad_class = broad_class),
             by = c("match_email" = "stripe_email")) %>%
-  mutate(broad_class = ifelse(is.na(broad_class), "Residential", broad_class))
+  mutate(broad_class = ifelse(is.na(cm_broad_class), "Residential", cm_broad_class)) %>%
+  select(-cm_broad_class)
 
 # Order size buckets
 order_detail <- order_detail %>%
