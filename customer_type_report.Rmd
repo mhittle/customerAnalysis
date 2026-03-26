@@ -575,7 +575,32 @@ colors_detail <- c("Professional" = "#2C5F8A", "Residential" = "#E8894A",
 
 # Executive Summary
 
-This report analyzes **`r comma(total_customers)`** paying customers active during **2023--2025**, representing **`r dollar(total_revenue)`** in lifetime revenue across **`r comma(total_orders)`** lifetime orders. Customer counts are scoped to the 2023--2025 period; revenue and order totals reflect each customer's full purchasing history from **Stripe** (authoritative payment system). Customer classification uses signals from **Zoho CRM** and **BigCommerce**. Year-over-year trend charts use BigCommerce order-level data (2023--2025 orders only).
+```{r period-revenue}
+# Calculate 2023-2025 period-specific revenue from BigCommerce
+bc_period_revenue <- sum(order_detail$order_total, na.rm = TRUE)
+bc_period_orders <- nrow(order_detail)
+
+# Period-specific by type from BC
+period_by_type <- order_detail %>%
+  group_by(broad_class) %>%
+  summarise(
+    period_revenue = sum(order_total, na.rm = TRUE),
+    period_orders = n(),
+    period_avg_order = mean(order_total, na.rm = TRUE),
+    period_customers = n_distinct(match_email, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_period_rev = round(period_revenue / sum(period_revenue) * 100, 1),
+    pct_period_orders = round(period_orders / sum(period_orders) * 100, 1)
+  )
+```
+
+This report examines the customer base and revenue performance across the **2023--2025** analysis period.
+
+> **Understanding the data:** This report draws on two complementary data sources. **Stripe** provides authoritative customer-level totals (lifetime revenue, total orders, LTV) for the **`r comma(total_customers)`** customers who were active during 2023--2025. These Stripe figures reflect each customer's *complete purchasing history*, including any spend before 2023. **BigCommerce** provides individual order records dated within 2023--2025 (**`r comma(bc_period_orders)`** orders, **`r dollar(bc_period_revenue)`** in revenue), used for trend analysis, seasonality, and geographic breakdowns. Stripe captures all payment channels; BigCommerce covers ~73% of customers but provides the order-level detail needed for time-series analysis.
+
+### Lifetime Metrics (Stripe — All-Time Spend for 2023-2025 Active Customers)
 
 ```{r exec-summary-table}
 exec_tbl <- type_summary %>%
@@ -583,15 +608,32 @@ exec_tbl <- type_summary %>%
     `Customer Type` = broad_class,
     Customers = comma(customers),
     `% Customers` = paste0(pct_customers, "%"),
-    Orders = comma(orders),
+    `Lifetime Orders` = comma(orders),
     `% Orders` = paste0(pct_orders, "%"),
-    Revenue = dollar(revenue),
+    `Lifetime Revenue` = dollar(revenue),
     `% Revenue` = paste0(pct_revenue, "%"),
-    `Avg Order` = dollar(avg_order),
-    `Avg LTV` = dollar(avg_ltv)
+    `Avg Order (Lifetime)` = dollar(avg_order),
+    `Avg LTV (Lifetime)` = dollar(avg_ltv)
   )
 
 kable(exec_tbl, align = "lrrrrrrrr")
+```
+
+### Period Metrics (BigCommerce — 2023-2025 Orders Only)
+
+```{r exec-period-table}
+period_tbl <- period_by_type %>%
+  transmute(
+    `Customer Type` = broad_class,
+    `2023-2025 Customers` = comma(period_customers),
+    `2023-2025 Orders` = comma(period_orders),
+    `% Orders` = paste0(pct_period_orders, "%"),
+    `2023-2025 Revenue` = dollar(period_revenue),
+    `% Revenue` = paste0(pct_period_rev, "%"),
+    `Avg Order (Period)` = dollar(period_avg_order)
+  )
+
+kable(period_tbl, align = "lrrrrrr")
 ```
 
 > **Classification certainty:** `r no_signal_pct`% of customers had no signal indicating either type and are assumed Residential. These are tracked separately in the confidence section below.
@@ -650,6 +692,8 @@ type_summary %>%
 
 # Average Order Size & Customer LTV
 
+*Stripe lifetime metrics for customers active 2023--2025. Average order = lifetime revenue / lifetime orders. LTV = total lifetime spend per customer.*
+
 ```{r plot-avg-ltv, fig.height=5}
 ltv_data <- type_summary %>%
   select(broad_class, `Avg Order Size` = avg_order, `Avg Customer LTV` = avg_ltv,
@@ -671,6 +715,8 @@ ltv_data %>%
 ```
 
 # Repeat Customer Behavior
+
+*Repeat rates and orders-per-customer from Stripe lifetime data for customers active 2023--2025. A customer is "repeat" if they have 2+ lifetime orders in Stripe.*
 
 ```{r plot-repeat, fig.height=5}
 repeat_data <- type_summary %>%
@@ -715,9 +761,9 @@ repeat_tbl <- type_summary %>%
     Customers = comma(customers),
     `Repeat Customers` = comma(repeat_customers),
     `Repeat Rate` = paste0(repeat_rate, "%"),
-    `Avg Orders/Customer` = avg_orders_per_cust,
-    `Avg LTV` = dollar(avg_ltv),
-    `Median LTV` = dollar(median_ltv)
+    `Avg Lifetime Orders` = avg_orders_per_cust,
+    `Avg Lifetime LTV` = dollar(avg_ltv),
+    `Median Lifetime LTV` = dollar(median_ltv)
   )
 
 kable(repeat_tbl, align = "lrrrrrr")
@@ -891,6 +937,8 @@ kable(coverage_tbl, align = "lr")
 ```
 
 # Order Economics Deep Dive
+
+All order-level analysis in this section uses **BigCommerce order data from 2023--2025** (`r comma(nrow(bc_clean))` orders). This is the only data source with individual order dates, amounts, and line-item detail. BigCommerce covers approximately 73% of the Stripe customer base.
 
 ```{r order-economics-data}
 # BigCommerce has order-level detail with dates — use for deep order analysis
@@ -1244,6 +1292,8 @@ monthly_aov %>%
 
 ## Revenue Concentration
 
+*Based on Stripe lifetime spend for customers active 2023--2025. Shows how total lifetime revenue is distributed across the customer base.*
+
 ```{r revenue-concentration, fig.height=5}
 # Customer-level revenue concentration (from Stripe master)
 cust_ranked <- customer_master %>%
@@ -1350,18 +1400,20 @@ aov_multiple <- round(pro_stats$avg_order / res_stats$avg_order, 1)
 repeat_delta <- round(pro_stats$repeat_rate - res_stats$repeat_rate, 1)
 ```
 
-The professional segment represents a compelling acquisition thesis:
+The professional segment represents a compelling acquisition thesis. All metrics below are **Stripe lifetime values** for customers active 2023--2025:
 
-| Metric | Professional | Residential | Pro Advantage |
+| Metric (Lifetime) | Professional | Residential | Pro Advantage |
 |--------|-------------|-------------|---------------|
-| Avg LTV | `r dollar(pro_stats$avg_ltv)` | `r dollar(res_stats$avg_ltv)` | **`r ltv_multiple`x** |
-| Avg Order Size | `r dollar(pro_stats$avg_order)` | `r dollar(res_stats$avg_order)` | **`r aov_multiple`x** |
-| Repeat Rate | `r paste0(round(pro_stats$repeat_rate, 1), "%")` | `r paste0(round(res_stats$repeat_rate, 1), "%")` | **+`r repeat_delta`pp** |
-| Avg Orders/Customer | `r round(pro_stats$avg_orders, 1)` | `r round(res_stats$avg_orders, 1)` | **`r round(pro_stats$avg_orders / res_stats$avg_orders, 1)`x** |
+| Avg Lifetime LTV | `r dollar(pro_stats$avg_ltv)` | `r dollar(res_stats$avg_ltv)` | **`r ltv_multiple`x** |
+| Avg Lifetime Order Size | `r dollar(pro_stats$avg_order)` | `r dollar(res_stats$avg_order)` | **`r aov_multiple`x** |
+| Lifetime Repeat Rate | `r paste0(round(pro_stats$repeat_rate, 1), "%")` | `r paste0(round(res_stats$repeat_rate, 1), "%")` | **+`r repeat_delta`pp** |
+| Avg Lifetime Orders | `r round(pro_stats$avg_orders, 1)` | `r round(res_stats$avg_orders, 1)` | **`r round(pro_stats$avg_orders / res_stats$avg_orders, 1)`x** |
 
 > **For Eagle Woodworking:** The professional customer segment delivers `r ltv_multiple`x the lifetime value of residential customers with `r repeat_delta` percentage points higher repeat rates. An acquirer with existing professional relationships and capacity in cabinet door manufacturing can accelerate growth in this high-LTV segment through cross-selling and trade program expansion, while the residential base provides stable, diversified volume.
 
 # Customer Retention & Cohort Analysis
+
+*All retention and cohort metrics in this section use BigCommerce order data (2023--2025). Cohorts are defined by quarter of first BigCommerce order within this period.*
 
 ```{r cohort-data}
 # Build customer cohorts based on first order date (from BC data)
@@ -1579,6 +1631,8 @@ gridExtra::grid.arrange(
 
 # Product & Order Composition
 
+*BigCommerce order data, 2023--2025. Line items counted from product columns in each order record.*
+
 ```{r product-mix-data}
 # Reshape BC order data from wide to long for product analysis
 # Products are in columns: Product Name - 1, Product Name - 2, etc.
@@ -1661,6 +1715,8 @@ kable(item_tbl, align = "lrrrrr")
 ```
 
 # Geographic Analysis
+
+*All geographic data uses BigCommerce shipping addresses from orders placed during 2023--2025.*
 
 ```{r geo-data}
 # Use shipping state from BC orders
@@ -1768,6 +1824,8 @@ kable(geo_tbl, align = "rlrrrrrr")
 
 # Revenue Quality
 
+*Refund analysis uses Stripe lifetime data for customers active 2023--2025. Revenue trajectory uses BigCommerce monthly order data (2023--2025).*
+
 ```{r revenue-quality}
 # Net revenue from Stripe (refunds)
 total_gross <- sum(customer_master$total_spend, na.rm = TRUE)
@@ -1843,6 +1901,8 @@ monthly_rev_enhanced %>%
 ```
 
 # Professional Segment Deep Dive
+
+*Sub-segment revenue and LTV use Stripe lifetime data. Top accounts show lifetime spend. Trade program analysis uses Zoho CRM signals matched to Stripe payment data.*
 
 ```{r pro-subsegments, fig.height=6}
 # Professional sub-segments from Zoho business type
@@ -2012,6 +2072,8 @@ trade_ltv_multiple <- round(trade_roi$avg_ltv[trade_roi$is_trade_member] /
 
 # Customer Lifetime Value Deep Dive
 
+All LTV figures in this section represent **total lifetime spend from Stripe** (all-time, not limited to 2023--2025), for the set of customers who were active during the 2023--2025 period. This captures the full economic relationship with each customer, including historical purchases that demonstrate account depth.
+
 ```{r ltv-distribution, fig.height=5}
 # LTV distribution by type
 customer_master %>%
@@ -2155,6 +2217,8 @@ kable(proj_tbl, align = "lrrrrrr")
 > Based on mature cohort behavior, the 2024--2025 customer base has an estimated **`r dollar(total_unrealized)`** in unrealized lifetime value — revenue that will materialize as these customers mature into repeat buyers. This represents embedded growth that an acquirer inherits at close.
 
 # Competitive Moat & Customer Stickiness
+
+*Tenure and frequency metrics use Stripe account creation dates and lifetime order counts. Multi-year analysis uses BigCommerce orders (2023--2025) to track year-over-year activity.*
 
 ## Customer Tenure
 
@@ -2307,6 +2371,8 @@ three_year_pct <- round(three_year_rev / sum(multi_year$total_spent, na.rm = TRU
 
 # Growth Levers
 
+*Dormant customer analysis uses BigCommerce order dates (2023--2025). Basket and AOV trends use BigCommerce quarterly data. Behavioral professional identification uses Stripe lifetime metrics.*
+
 ## Dormant Customer Reactivation
 
 ```{r dormant, fig.height=5}
@@ -2437,6 +2503,8 @@ kable(behav_tbl, align = "lrrrrr")
 > **`r comma(n_behavioral_pro)`** customers classified as Residential exhibit professional buying patterns (3+ orders, $1,000+ lifetime spend), generating **`r dollar(rev_behavioral_pro)`** in revenue. These are likely undiscovered professionals who could be converted into the trade program — a zero-cost revenue uplift.
 
 # Risk Mitigation
+
+*Customer concentration uses Stripe lifetime revenue. Channel analysis uses BigCommerce orders (2023--2025) classified by Order ID patterns. Predictability analysis uses BigCommerce order dates.*
 
 ## Customer Concentration Risk
 
