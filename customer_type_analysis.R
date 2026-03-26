@@ -17,9 +17,11 @@ library(gridExtra)
 bc_orders <- read_csv("orders-2026-03-25.csv", show_col_types = FALSE)
 zoho_contacts <- read_csv("Contacts_2026_03_25.csv", show_col_types = FALSE)
 zoho_accounts <- read_csv("Accounts_2025_03_25.csv", show_col_types = FALSE)
+bc_customers <- read_csv("BC_customers.csv", show_col_types = FALSE)
 stripe_customers <- read_csv("stripe_unified_customers.csv", show_col_types = FALSE)
 
 cat("BigCommerce orders loaded:", nrow(bc_orders), "rows\n")
+cat("BigCommerce customers loaded:", nrow(bc_customers), "rows\n")
 cat("Zoho contacts loaded:", nrow(zoho_contacts), "rows\n")
 cat("Zoho accounts loaded:", nrow(zoho_accounts), "rows\n")
 cat("Stripe customers loaded:", nrow(stripe_customers), "rows\n")
@@ -414,11 +416,47 @@ bc_name_lookup <- bc_clean %>%
 
 cat("BC name-based pro signals:", nrow(bc_name_lookup), "unique names\n")
 
-# Enrich from BigCommerce for unmatched
-# Three places in BC that can indicate professional:
-# 1. Shipping Company
-# 2. Billing Company
-# 3. Customer Group Name
+# --- BC Customers file: Company field = professional ---
+bc_cust_lookup <- bc_customers %>%
+  mutate(
+    bc_cust_email = tolower(trimws(Email)),
+    bc_cust_company = tolower(trimws(Company)),
+    bc_cust_name = tolower(trimws(paste(`First Name`, `Last Name`)))
+  ) %>%
+  filter(!is.na(bc_cust_email) & bc_cust_email != "") %>%
+  mutate(
+    bc_cust_has_company = !is.na(bc_cust_company) & bc_cust_company != "" &
+      !bc_cust_company %in% c("n/a", "na", "none", "-", "self", "home", "retired")
+  ) %>%
+  filter(bc_cust_has_company) %>%
+  distinct(bc_cust_email) %>%
+  mutate(bc_cust_is_pro = TRUE)
+
+cat("BC customers with Company field:", nrow(bc_cust_lookup), "\n")
+
+# --- Business name keywords in personal email accounts ---
+# If someone uses gmail/yahoo but their name contains business keywords, flag as pro
+biz_keywords <- c(
+  "cabinetry", "cabinets", "cabinet", "painting", "painters", "paint",
+  "handyman", "design", "designs", "designer", "designing",
+  "homes", "home builder", "homebuilder", "builders", "building",
+  "construction", "contracting", "contractor", "contractors",
+  "remodel", "remodeling", "remodelers", "renovation", "renovations",
+  "woodwork", "woodworking", "millwork", "carpentry", "carpenter",
+  "plumbing", "plumber", "electric", "electrical", "electrician",
+  "roofing", "roofer", "flooring", "tile", "tiling",
+  "restoration", "restorations", "maintenance",
+  "property", "properties", "real estate", "realty",
+  "interiors", "interior", "staging", "decor",
+  "kitchen", "kitchens", "bath",
+  "llc", "inc", "corp", "co\\.", "& sons", "& son",
+  "enterprises", "services", "solutions", "group", "associates",
+  "custom", "pro ", "professional"
+)
+biz_pattern <- paste(biz_keywords, collapse = "|")
+
+# Enrich from BigCommerce orders
+# Signals: Shipping Company (any entry), Billing Company, Customer Group
 bc_company_lookup <- bc_clean %>%
   filter(!is.na(match_email)) %>%
   group_by(match_email) %>%
@@ -426,36 +464,62 @@ bc_company_lookup <- bc_clean %>%
     bc_shipping_company = first(na.omit(shipping_company)),
     bc_billing_company = first(na.omit(billing_company)),
     bc_customer_group = first(na.omit(customer_group)),
+    bc_customer_name = first(na.omit(customer_name)),
     .groups = "drop"
   ) %>%
   mutate(
+    # Shipping Company: ANY entry = professional
     bc_has_shipping_co = !is.na(bc_shipping_company) & bc_shipping_company != "" &
       !bc_shipping_company %in% c("n/a", "na", "none", "-"),
     bc_has_billing_co = !is.na(bc_billing_company) & bc_billing_company != "" &
       !bc_billing_company %in% c("n/a", "na", "none", "-"),
     bc_has_company = bc_has_shipping_co | bc_has_billing_co,
+    # Customer Group: Contractors and Trade Program - Level 1 = professional
     bc_group_pro = bc_customer_group %in% c(
       "professional", "commercial", "trade", "wholesale", "dealer",
-      "contractor", "builder", "business"
-    )
+      "contractor", "contractors", "builder", "business",
+      "trade program - level 1"
+    ),
+    bc_group_residential = bc_customer_group == "residential",
+    # Business name in customer name (even with personal email)
+    bc_name_has_biz = !is.na(bc_customer_name) &
+      grepl(biz_pattern, tolower(bc_customer_name), ignore.case = TRUE)
   )
+
+# Also check if Stripe name itself has business keywords
+stripe_name_has_biz <- customer_master %>%
+  filter(!is.na(stripe_match_name) & stripe_match_name != "") %>%
+  mutate(has_biz = grepl(biz_pattern, stripe_match_name, ignore.case = TRUE)) %>%
+  filter(has_biz) %>%
+  distinct(stripe_email) %>%
+  mutate(stripe_name_is_biz = TRUE)
+
+cat("Stripe customers with business keywords in name:", nrow(stripe_name_has_biz), "\n")
 
 customer_master <- customer_master %>%
   left_join(bc_company_lookup, by = c("stripe_email" = "match_email")) %>%
   left_join(acct_lookup, by = c("stripe_email" = "acct_email")) %>%
   left_join(bc_address_signal, by = c("stripe_email" = "match_email")) %>%
   left_join(bc_name_lookup, by = c("stripe_match_name" = "match_name")) %>%
+  left_join(bc_cust_lookup, by = c("stripe_email" = "bc_cust_email")) %>%
+  left_join(stripe_name_has_biz, by = "stripe_email") %>%
   mutate(
     acct_is_professional = ifelse(is.na(acct_is_professional), FALSE, acct_is_professional),
     has_diff_ship_bill = ifelse(is.na(has_diff_ship_bill), FALSE, has_diff_ship_bill),
     bc_name_is_pro = ifelse(is.na(bc_name_is_pro), FALSE, bc_name_is_pro),
+    bc_cust_is_pro = ifelse(is.na(bc_cust_is_pro), FALSE, bc_cust_is_pro),
+    bc_name_has_biz = ifelse(is.na(bc_name_has_biz), FALSE, bc_name_has_biz),
+    stripe_name_is_biz = ifelse(is.na(stripe_name_is_biz), FALSE, stripe_name_is_biz),
 
     # Professional always wins: if ANY source says pro, they're pro
     final_class = case_when(
       customer_class == "Professional"       ~ "Professional",
       acct_is_professional                   ~ "Professional",
       bc_has_company | bc_group_pro          ~ "Professional",
+      bc_cust_is_pro                         ~ "Professional",
       bc_name_is_pro                         ~ "Professional",
+      bc_name_has_biz                        ~ "Professional",
+      stripe_name_is_biz                     ~ "Professional",
       has_diff_ship_bill                     ~ "Professional",
       customer_class == "Residential"        ~ "Residential",
       TRUE                                   ~ "Unknown"
@@ -507,21 +571,26 @@ orders_merged <- bc_clean %>%
             by = c("bc_match_name" = "match_name")) %>%
   mutate(customer_class = ifelse(is.na(customer_class), name_customer_class, customer_class)) %>%
   select(-name_customer_class) %>%
-  left_join(bc_company_lookup %>% select(match_email, bc_has_company, bc_group_pro),
+  left_join(bc_company_lookup %>% select(match_email, bc_has_company, bc_group_pro, bc_name_has_biz),
             by = c("match_email" = "match_email")) %>%
   left_join(acct_lookup, by = c("match_email" = "acct_email")) %>%
   left_join(bc_address_signal, by = c("match_email" = "match_email")) %>%
   left_join(bc_name_lookup, by = c("bc_match_name" = "match_name")) %>%
+  left_join(bc_cust_lookup, by = c("match_email" = "bc_cust_email")) %>%
   mutate(
     acct_is_professional = ifelse(is.na(acct_is_professional), FALSE, acct_is_professional),
     has_diff_ship_bill = ifelse(is.na(has_diff_ship_bill), FALSE, has_diff_ship_bill),
     bc_name_is_pro = ifelse(is.na(bc_name_is_pro), FALSE, bc_name_is_pro),
+    bc_cust_is_pro = ifelse(is.na(bc_cust_is_pro), FALSE, bc_cust_is_pro),
+    bc_name_has_biz = ifelse(is.na(bc_name_has_biz), FALSE, bc_name_has_biz),
     # Professional always wins
     final_class = case_when(
       customer_class == "Professional"       ~ "Professional",
       acct_is_professional                   ~ "Professional",
       bc_has_company | bc_group_pro          ~ "Professional",
+      bc_cust_is_pro                         ~ "Professional",
       bc_name_is_pro                         ~ "Professional",
+      bc_name_has_biz                        ~ "Professional",
       has_diff_ship_bill                     ~ "Professional",
       customer_class == "Residential"        ~ "Residential",
       TRUE                                   ~ "Unknown"
