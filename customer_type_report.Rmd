@@ -900,7 +900,16 @@ order_detail <- bc_clean %>%
   mutate(
     order_month = floor_date(order_date, "month"),
     order_quarter = floor_date(order_date, "quarter"),
-    bc_match_name = tolower(trimws(customer_name))
+    bc_match_name = tolower(trimws(customer_name)),
+    order_id_str = as.character(`Order ID`),
+    order_id_num = as.numeric(`Order ID`),
+    # Channel classification based on Order ID patterns
+    website = case_when(
+      nchar(order_id_str) > 5 & grepl("^41000", order_id_str) ~ "CabinetDoorMart.com",
+      grepl("^900", order_id_str)                              ~ "CabMod.com",
+      order_id_num >= 40000 & order_id_num <= 89999            ~ "CabinetNow.com",
+      TRUE                                                      ~ "Other"
+    )
   ) %>%
   left_join(customer_master %>% select(stripe_email, cm_broad_class = broad_class),
             by = c("match_email" = "stripe_email")) %>%
@@ -2466,52 +2475,93 @@ kable(conc_risk_tbl, align = "lr")
 ## Revenue by Website / Sales Channel
 
 ```{r channel-mix, fig.height=5}
-# Website Source from Zoho or BC data
+# Channel classification based on Order ID patterns
+website_colors <- c("CabinetNow.com" = "#2C5F8A", "CabinetDoorMart.com" = "#E8894A",
+                     "CabMod.com" = "#27AE60", "Other" = "#95A5A6")
+
 channel_data <- order_detail %>%
-  mutate(
-    channel = case_when(
-      !is.na(`Channel Name`) & `Channel Name` != "" ~ tolower(trimws(`Channel Name`)),
-      TRUE ~ "unknown"
-    )
-  ) %>%
-  group_by(order_year, channel) %>%
+  group_by(order_year, website) %>%
   summarise(
     orders = n(),
     revenue = sum(order_total, na.rm = TRUE),
+    customers = n_distinct(match_email, na.rm = TRUE),
+    avg_order = mean(order_total, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   group_by(order_year) %>%
   mutate(pct_revenue = round(revenue / sum(revenue) * 100, 1)) %>%
   ungroup()
 
-if (n_distinct(channel_data$channel) > 1) {
+gridExtra::grid.arrange(
   channel_data %>%
-    filter(channel != "unknown") %>%
-    ggplot(aes(x = factor(order_year), y = revenue, fill = channel)) +
+    ggplot(aes(x = factor(order_year), y = revenue, fill = website)) +
     geom_col(width = 0.6) +
+    scale_fill_manual(values = website_colors) +
     scale_y_continuous(labels = dollar) +
-    labs(title = "Revenue by Sales Channel",
-         x = "Year", y = "Revenue", fill = "Channel") +
-    theme_buyer
-}
+    labs(title = "Revenue by Website", x = "Year", y = "Revenue", fill = "") +
+    theme_buyer,
+
+  channel_data %>%
+    ggplot(aes(x = factor(order_year), y = pct_revenue, fill = website)) +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = ifelse(pct_revenue >= 3, paste0(pct_revenue, "%"), "")),
+              position = position_stack(vjust = 0.5), size = 3.5, color = "white", fontface = "bold") +
+    scale_fill_manual(values = website_colors) +
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(title = "Revenue Share by Website", x = "Year", y = "% of Revenue", fill = "") +
+    theme_buyer,
+
+  ncol = 2
+)
 ```
 
 ```{r channel-table}
 channel_totals <- channel_data %>%
-  group_by(channel) %>%
+  group_by(website) %>%
   summarise(
     orders = sum(orders),
     revenue = sum(revenue),
+    customers = sum(customers),
+    avg_order = sum(revenue) / sum(orders),
     .groups = "drop"
   ) %>%
   mutate(pct = round(revenue / sum(revenue) * 100, 1)) %>%
   arrange(desc(revenue))
 
 channel_tbl <- channel_totals %>%
-  transmute(Channel = channel, Orders = comma(orders),
-            Revenue = dollar(revenue), `% of Revenue` = paste0(pct, "%"))
-kable(channel_tbl, align = "lrrr")
+  transmute(Website = website, Orders = comma(orders), Customers = comma(customers),
+            Revenue = dollar(revenue), `% of Revenue` = paste0(pct, "%"),
+            `Avg Order` = dollar(avg_order))
+kable(channel_tbl, align = "lrrrrr")
 ```
+
+```{r channel-by-type, fig.height=5}
+# Website mix by customer type
+channel_by_type <- order_detail %>%
+  group_by(website, broad_class) %>%
+  summarise(
+    orders = n(),
+    revenue = sum(order_total, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(website) %>%
+  mutate(pct_revenue = round(revenue / sum(revenue) * 100, 1)) %>%
+  ungroup()
+
+channel_by_type %>%
+  ggplot(aes(x = website, y = revenue, fill = broad_class)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0(pct_revenue, "%")),
+            position = position_stack(vjust = 0.5), size = 4, color = "white", fontface = "bold") +
+  scale_fill_manual(values = colors_class) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Revenue by Website and Customer Type",
+       subtitle = "Professional vs Residential mix across properties",
+       x = "", y = "Revenue", fill = "Customer Type") +
+  theme_buyer
+```
+
+> The multi-website portfolio provides **channel diversification** and enables targeted positioning — CabinetNow.com as the flagship, CabinetDoorMart.com for door-specific customers, and CabMod.com for the modification/refacing segment.
 
 ## Revenue Predictability
 
