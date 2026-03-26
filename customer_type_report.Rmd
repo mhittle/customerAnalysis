@@ -575,7 +575,7 @@ colors_detail <- c("Professional" = "#2C5F8A", "Residential" = "#E8894A",
 
 # Executive Summary
 
-This report analyzes **`r comma(total_customers)`** paying customers representing **`r dollar(total_revenue)`** in total revenue across **`r comma(total_orders)`** orders. Revenue and customer counts are sourced from **Stripe** (authoritative payment system). Customer classification uses signals from **Zoho CRM** and **BigCommerce**.
+This report analyzes **`r comma(total_customers)`** paying customers active during **2023--2025**, representing **`r dollar(total_revenue)`** in lifetime revenue across **`r comma(total_orders)`** lifetime orders. Customer counts are scoped to the 2023--2025 period; revenue and order totals reflect each customer's full purchasing history from **Stripe** (authoritative payment system). Customer classification uses signals from **Zoho CRM** and **BigCommerce**. Year-over-year trend charts use BigCommerce order-level data (2023--2025 orders only).
 
 ```{r exec-summary-table}
 exec_tbl <- type_summary %>%
@@ -611,8 +611,8 @@ type_summary %>%
   scale_fill_manual(values = colors_class) +
   scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.2))) +
   labs(x = "", y = "Customers", fill = "Customer Type",
-       title = "Customers by Type",
-       subtitle = "Based on Stripe payment records (paying customers only)") +
+       title = "Customers by Type (2023-2025)",
+       subtitle = "Stripe customers active in period; lifetime spend shown") +
   theme_buyer
 ```
 
@@ -627,8 +627,8 @@ type_summary %>%
   scale_fill_manual(values = colors_class) +
   scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.2))) +
   labs(x = "", y = "Revenue", fill = "Customer Type",
-       title = "Revenue by Customer Type",
-       subtitle = "Total lifetime revenue from Stripe") +
+       title = "Revenue by Customer Type (Lifetime)",
+       subtitle = "Total lifetime revenue for customers active 2023-2025") +
   theme_buyer
 ```
 
@@ -643,8 +643,8 @@ type_summary %>%
   scale_fill_manual(values = colors_class) +
   scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.2))) +
   labs(x = "", y = "Orders", fill = "Customer Type",
-       title = "Orders by Customer Type",
-       subtitle = "Total order count from Stripe") +
+       title = "Orders by Customer Type (Lifetime)",
+       subtitle = "Total lifetime orders for customers active 2023-2025") +
   theme_buyer
 ```
 
@@ -666,7 +666,7 @@ ltv_data %>%
   scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
   labs(x = "", y = "", fill = "Customer Type",
        title = "Order Size & Lifetime Value by Customer Type",
-       subtitle = "From Stripe payment data") +
+       subtitle = "Lifetime metrics for customers active 2023-2025") +
   theme_buyer
 ```
 
@@ -701,7 +701,7 @@ gridExtra::grid.arrange(
     scale_fill_manual(values = colors_class) +
     scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
     labs(x = "", y = "Avg Orders", fill = "Customer Type",
-         title = "Orders per Customer", subtitle = "Average from Stripe") +
+         title = "Orders per Customer", subtitle = "Lifetime avg, customers active 2023-2025") +
     theme_buyer,
 
   ncol = 2
@@ -1111,7 +1111,8 @@ monthly_by_type %>%
   scale_fill_manual(values = colors_class) +
   scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
   scale_y_continuous(labels = dollar) +
-  labs(title = "Monthly Revenue by Customer Type",
+  labs(title = "Monthly Revenue by Customer Type (2023-2025)",
+       subtitle = "BigCommerce order data",
        x = "", y = "Revenue", fill = "Customer Type") +
   theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
@@ -1640,8 +1641,8 @@ item_summary %>%
             position = position_dodge(width = 0.7), vjust = -0.3, size = 3.5) +
   scale_fill_manual(values = c("% of Orders" = "#2C5F8A", "% of Revenue" = "#E8894A")) +
   scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.15))) +
-  labs(title = "Order Complexity: Items per Order",
-       subtitle = "Multi-item orders correlate with larger project spending",
+  labs(title = "Order Complexity: Items per Order (2023-2025)",
+       subtitle = "BigCommerce orders; multi-item orders correlate with larger project spending",
        x = "", y = "", fill = "") +
   theme_buyer
 ```
@@ -1698,8 +1699,8 @@ geo_summary %>%
             hjust = -0.05, size = 3.5) +
   scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.3))) +
   coord_flip() +
-  labs(title = "Top 20 Markets by Revenue",
-       subtitle = paste0("Top 5 states = ", round(top5_rev_pct, 1), "% of revenue | ",
+  labs(title = "Top 20 Markets by Revenue (2023-2025)",
+       subtitle = paste0("BigCommerce orders | Top 5 states = ", round(top5_rev_pct, 1), "% | ",
                          "Top 10 = ", round(top10_rev_pct, 1), "%"),
        x = "", y = "Revenue") +
   theme_buyer
@@ -1724,7 +1725,8 @@ geo_by_type %>%
   scale_fill_manual(values = colors_class) +
   scale_y_continuous(labels = dollar) +
   coord_flip() +
-  labs(title = "Top 15 Markets: Professional vs. Residential Mix",
+  labs(title = "Top 15 Markets: Professional vs. Residential Mix (2023-2025)",
+       subtitle = "BigCommerce order data",
        x = "", y = "Revenue", fill = "Customer Type") +
   theme_buyer
 ```
@@ -1742,8 +1744,8 @@ geo_summary %>%
   annotate("text", x = n_states * 0.7, y = 82, label = "80% of revenue", color = "gray40", size = 4) +
   scale_x_continuous(breaks = seq(0, n_states, 5)) +
   scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 105)) +
-  labs(title = "Geographic Revenue Concentration",
-       subtitle = paste0("Revenue comes from ", n_states, " states — ",
+  labs(title = "Geographic Revenue Concentration (2023-2025)",
+       subtitle = paste0("BigCommerce orders | ", n_states, " states — ",
                          "top 10 account for ", round(top10_rev_pct, 1), "%"),
        x = "Number of States (ranked by revenue)", y = "Cumulative % of Revenue") +
   theme_buyer
@@ -1878,8 +1880,8 @@ pro_subseg_summary %>%
             hjust = -0.05, size = 3.5) +
   scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.35))) +
   coord_flip() +
-  labs(title = "Professional Sub-Segments by Revenue",
-       subtitle = "Top 10 professional categories",
+  labs(title = "Professional Sub-Segments by Lifetime Revenue",
+       subtitle = "Top 10 categories; lifetime spend for professionals active 2023-2025",
        x = "", y = "Revenue") +
   theme_buyer
 ```
@@ -2186,7 +2188,7 @@ gridExtra::grid.arrange(
     geom_col(position = "dodge", width = 0.7) +
     scale_fill_manual(values = colors_class) +
     scale_y_continuous(labels = comma) +
-    labs(title = "Customers by Tenure", x = "", y = "Customers", fill = "") +
+    labs(title = "Customers by Tenure (since Stripe account creation)", x = "", y = "Customers", fill = "") +
     theme_buyer,
 
   tenure_summary %>%
@@ -2196,7 +2198,7 @@ gridExtra::grid.arrange(
               position = position_dodge(width = 0.7), vjust = -0.3, size = 3) +
     scale_fill_manual(values = colors_class) +
     scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
-    labs(title = "Avg LTV by Tenure", x = "", y = "Avg LTV", fill = "") +
+    labs(title = "Avg Lifetime Spend by Tenure", x = "", y = "Avg LTV", fill = "") +
     theme_buyer,
 
   ncol = 2
@@ -2373,8 +2375,8 @@ gridExtra::grid.arrange(
     geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "#E8894A") +
     scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
     scale_y_continuous(labels = dollar) +
-    labs(title = "Core Order AOV Trend ($150+)",
-         subtitle = "With linear trend line",
+    labs(title = "Core Order AOV Trend, $150+ (2023-2025)",
+         subtitle = "BigCommerce quarterly; with linear trend line",
          x = "", y = "Avg Order Value") +
     theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
 
@@ -2383,8 +2385,8 @@ gridExtra::grid.arrange(
     geom_line(color = "#2C5F8A", linewidth = 1) +
     geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "#E8894A") +
     scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
-    labs(title = "Avg Items per Order Trend",
-         subtitle = "With linear trend line",
+    labs(title = "Avg Items per Order Trend (2023-2025)",
+         subtitle = "BigCommerce quarterly; with linear trend line",
          x = "", y = "Avg Items") +
     theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
 
@@ -2555,8 +2557,8 @@ channel_by_type %>%
             position = position_stack(vjust = 0.5), size = 4, color = "white", fontface = "bold") +
   scale_fill_manual(values = colors_class) +
   scale_y_continuous(labels = dollar) +
-  labs(title = "Revenue by Website and Customer Type",
-       subtitle = "Professional vs Residential mix across properties",
+  labs(title = "Revenue by Website and Customer Type (2023-2025)",
+       subtitle = "BigCommerce orders; professional vs residential mix across properties",
        x = "", y = "Revenue", fill = "Customer Type") +
   theme_buyer
 ```
