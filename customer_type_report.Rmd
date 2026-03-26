@@ -29,6 +29,8 @@ library(lubridate)
 library(scales)
 library(gridExtra)
 library(knitr)
+if (!requireNamespace("zoo", quietly = TRUE)) install.packages("zoo", quiet = TRUE)
+library(zoo)
 ```
 
 ```{r load-data}
@@ -1347,6 +1349,610 @@ The professional segment represents a compelling acquisition thesis:
 | Avg Orders/Customer | `r round(pro_stats$avg_orders, 1)` | `r round(res_stats$avg_orders, 1)` | **`r round(pro_stats$avg_orders / res_stats$avg_orders, 1)`x** |
 
 > **For Eagle Woodworking:** The professional customer segment delivers `r ltv_multiple`x the lifetime value of residential customers with `r repeat_delta` percentage points higher repeat rates. An acquirer with existing professional relationships and capacity in cabinet door manufacturing can accelerate growth in this high-LTV segment through cross-selling and trade program expansion, while the residential base provides stable, diversified volume.
+
+# Customer Retention & Cohort Analysis
+
+```{r cohort-data}
+# Build customer cohorts based on first order date (from BC data)
+customer_cohorts <- order_detail %>%
+  filter(!is.na(match_email)) %>%
+  group_by(match_email) %>%
+  mutate(
+    first_order_date = min(order_date, na.rm = TRUE),
+    first_order_quarter = floor_date(first_order_date, "quarter"),
+    first_order_year = year(first_order_date),
+    order_num = row_number()
+  ) %>%
+  ungroup()
+
+# Cohort quarterly retention
+cohort_retention <- customer_cohorts %>%
+  mutate(
+    cohort = format(first_order_quarter, "%Y Q%q"),
+    cohort = paste0(year(first_order_quarter), " Q", quarter(first_order_quarter)),
+    periods_since = as.numeric(difftime(order_quarter, first_order_quarter, units = "days")) %/% 91
+  ) %>%
+  group_by(cohort, first_order_quarter, periods_since) %>%
+  summarise(customers = n_distinct(match_email), .groups = "drop")
+
+# Get cohort sizes (period 0)
+cohort_sizes <- cohort_retention %>%
+  filter(periods_since == 0) %>%
+  select(cohort, first_order_quarter, cohort_size = customers)
+
+cohort_retention <- cohort_retention %>%
+  left_join(cohort_sizes, by = c("cohort", "first_order_quarter")) %>%
+  mutate(retention_pct = round(customers / cohort_size * 100, 1))
+```
+
+## Cohort Retention Heatmap
+
+```{r cohort-heatmap, fig.height=7, fig.width=10}
+cohort_retention %>%
+  filter(periods_since <= 8) %>%
+  ggplot(aes(x = factor(periods_since), y = reorder(cohort, first_order_quarter), fill = retention_pct)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = paste0(retention_pct, "%")), size = 3, color = "white", fontface = "bold") +
+  scale_fill_gradient(low = "#E8894A", high = "#2C5F8A", limits = c(0, 100)) +
+  labs(title = "Customer Retention by Quarterly Cohort",
+       subtitle = "% of cohort's customers who placed an order in each subsequent quarter",
+       x = "Quarters Since First Order", y = "Cohort", fill = "Retention %") +
+  theme_buyer +
+  theme(panel.grid = element_blank())
+```
+
+## New vs. Returning Customers
+
+```{r new-vs-returning, fig.height=5}
+new_vs_return <- customer_cohorts %>%
+  mutate(
+    is_new = order_num == 1,
+    customer_status = ifelse(is_new, "New Customer", "Returning Customer")
+  ) %>%
+  group_by(order_quarter, customer_status) %>%
+  summarise(
+    customers = n_distinct(match_email),
+    revenue = sum(order_total, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+gridExtra::grid.arrange(
+  new_vs_return %>%
+    ggplot(aes(x = order_quarter, y = customers, fill = customer_status)) +
+    geom_col(width = 80) +
+    scale_fill_manual(values = c("New Customer" = "#2C5F8A", "Returning Customer" = "#E8894A")) +
+    scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+    scale_y_continuous(labels = comma) +
+    labs(title = "Customer Acquisition: New vs. Returning",
+         x = "", y = "Customers", fill = "") +
+    theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+
+  new_vs_return %>%
+    ggplot(aes(x = order_quarter, y = revenue, fill = customer_status)) +
+    geom_col(width = 80) +
+    scale_fill_manual(values = c("New Customer" = "#2C5F8A", "Returning Customer" = "#E8894A")) +
+    scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+    scale_y_continuous(labels = dollar) +
+    labs(title = "Revenue: New vs. Returning Customers",
+         x = "", y = "Revenue", fill = "") +
+    theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+
+  ncol = 2
+)
+```
+
+```{r new-vs-return-pct, fig.height=5}
+new_return_pct <- new_vs_return %>%
+  group_by(order_quarter) %>%
+  mutate(pct_rev = round(revenue / sum(revenue) * 100, 1)) %>%
+  ungroup()
+
+new_return_pct %>%
+  ggplot(aes(x = order_quarter, y = pct_rev, fill = customer_status)) +
+  geom_area(alpha = 0.85) +
+  scale_fill_manual(values = c("New Customer" = "#2C5F8A", "Returning Customer" = "#E8894A")) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Revenue Mix: New vs. Returning Customers",
+       subtitle = "Growing returning-customer share = compounding customer base",
+       x = "", y = "% of Revenue", fill = "") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Time Between Orders
+
+```{r time-between-orders, fig.height=5}
+repeat_gaps <- customer_cohorts %>%
+  filter(!is.na(match_email)) %>%
+  arrange(match_email, order_date) %>%
+  group_by(match_email) %>%
+  mutate(
+    prev_order_date = lag(order_date),
+    days_between = as.numeric(difftime(order_date, prev_order_date, units = "days"))
+  ) %>%
+  filter(!is.na(days_between)) %>%
+  ungroup() %>%
+  left_join(customer_master %>% select(stripe_email, broad_class),
+            by = c("match_email" = "stripe_email")) %>%
+  mutate(broad_class = ifelse(is.na(broad_class), "Residential", broad_class))
+
+gap_summary <- repeat_gaps %>%
+  group_by(broad_class) %>%
+  summarise(
+    reorders = n(),
+    mean_days = round(mean(days_between)),
+    median_days = round(median(days_between)),
+    p25_days = round(quantile(days_between, 0.25)),
+    p75_days = round(quantile(days_between, 0.75)),
+    .groups = "drop"
+  )
+
+repeat_gaps %>%
+  filter(days_between <= 365) %>%
+  ggplot(aes(x = days_between, fill = broad_class)) +
+  geom_histogram(binwidth = 14, alpha = 0.7, position = "identity") +
+  geom_vline(data = gap_summary, aes(xintercept = median_days, color = broad_class),
+             linetype = "dashed", linewidth = 1) +
+  scale_fill_manual(values = colors_class) +
+  scale_color_manual(values = colors_class) +
+  scale_x_continuous(breaks = seq(0, 365, 30)) +
+  labs(title = "Time Between Repeat Orders",
+       subtitle = "Distribution of days between consecutive orders (capped at 365 days)",
+       x = "Days Between Orders", y = "Count", fill = "Customer Type", color = "Median") +
+  theme_buyer
+```
+
+```{r gap-table}
+gap_tbl <- gap_summary %>%
+  transmute(
+    Type = broad_class,
+    `Repeat Orders` = comma(reorders),
+    `Mean Gap (days)` = mean_days,
+    `Median Gap (days)` = median_days,
+    `25th Pctile` = p25_days,
+    `75th Pctile` = p75_days
+  )
+kable(gap_tbl, align = "lrrrrr")
+```
+
+> Professional customers reorder on a project-driven cycle. The tight interquartile range suggests predictable demand patterns that support production planning and inventory management.
+
+## Single-Order Customer Risk
+
+```{r single-order-risk, fig.height=5}
+single_vs_multi <- customer_master %>%
+  mutate(order_group = case_when(
+    total_orders == 1 ~ "Single Order",
+    total_orders <= 3 ~ "2-3 Orders",
+    total_orders <= 5 ~ "4-5 Orders",
+    TRUE ~ "6+ Orders"
+  )) %>%
+  mutate(order_group = factor(order_group, levels = c("Single Order", "2-3 Orders", "4-5 Orders", "6+ Orders"))) %>%
+  group_by(order_group, broad_class) %>%
+  summarise(
+    customers = n(),
+    revenue = sum(total_spend, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(broad_class) %>%
+  mutate(
+    pct_customers = round(customers / sum(customers) * 100, 1),
+    pct_revenue = round(revenue / sum(revenue) * 100, 1)
+  ) %>%
+  ungroup()
+
+gridExtra::grid.arrange(
+  single_vs_multi %>%
+    ggplot(aes(x = order_group, y = pct_customers, fill = broad_class)) +
+    geom_col(position = "dodge", width = 0.7) +
+    geom_text(aes(label = paste0(pct_customers, "%")),
+              position = position_dodge(width = 0.7), vjust = -0.3, size = 3.5) +
+    scale_fill_manual(values = colors_class) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.15))) +
+    labs(title = "Customer Distribution by Order Frequency",
+         x = "", y = "% of Customers", fill = "Customer Type") +
+    theme_buyer,
+
+  single_vs_multi %>%
+    ggplot(aes(x = order_group, y = pct_revenue, fill = broad_class)) +
+    geom_col(position = "dodge", width = 0.7) +
+    geom_text(aes(label = paste0(pct_revenue, "%")),
+              position = position_dodge(width = 0.7), vjust = -0.3, size = 3.5) +
+    scale_fill_manual(values = colors_class) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.15))) +
+    labs(title = "Revenue Distribution by Order Frequency",
+         x = "", y = "% of Revenue", fill = "Customer Type") +
+    theme_buyer,
+
+  ncol = 2
+)
+```
+
+# Product & Order Composition
+
+```{r product-mix-data}
+# Reshape BC order data from wide to long for product analysis
+# Products are in columns: Product Name - 1, Product Name - 2, etc.
+product_cols <- names(bc_clean)[grepl("^Product Name - \\d+$", names(bc_clean))]
+qty_cols <- names(bc_clean)[grepl("^Product Qty - \\d+$", names(bc_clean))]
+price_cols <- names(bc_clean)[grepl("^Product Total Price - \\d+$", names(bc_clean))]
+
+# Count products per order
+order_detail <- order_detail %>%
+  mutate(
+    n_line_items = rowSums(!is.na(select(bc_clean[match(order_detail$`Order ID`, bc_clean$`Order ID`), ], all_of(product_cols))) &
+                           select(bc_clean[match(order_detail$`Order ID`, bc_clean$`Order ID`), ], all_of(product_cols)) != "", na.rm = TRUE)
+  )
+```
+
+```{r product-mix-fallback}
+# Simpler approach: count non-empty product name columns per order
+line_item_counts <- bc_clean %>%
+  select(`Order ID`, all_of(product_cols)) %>%
+  mutate(across(all_of(product_cols), ~!is.na(.) & . != "")) %>%
+  mutate(n_items = rowSums(across(all_of(product_cols)))) %>%
+  select(`Order ID`, n_items)
+
+order_detail <- order_detail %>%
+  select(-any_of("n_line_items")) %>%
+  left_join(line_item_counts, by = "Order ID")
+```
+
+## Multi-Item Orders
+
+```{r multi-item, fig.height=5}
+item_summary <- order_detail %>%
+  mutate(item_group = case_when(
+    n_items == 1 ~ "1 Item",
+    n_items == 2 ~ "2 Items",
+    n_items <= 5 ~ "3-5 Items",
+    n_items <= 10 ~ "6-10 Items",
+    TRUE ~ "11+ Items"
+  )) %>%
+  mutate(item_group = factor(item_group, levels = c("1 Item", "2 Items", "3-5 Items", "6-10 Items", "11+ Items"))) %>%
+  group_by(item_group) %>%
+  summarise(
+    orders = n(),
+    revenue = sum(order_total, na.rm = TRUE),
+    avg_order = mean(order_total, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_orders = round(orders / sum(orders) * 100, 1),
+    pct_revenue = round(revenue / sum(revenue) * 100, 1)
+  )
+
+item_summary %>%
+  select(item_group, pct_orders, pct_revenue) %>%
+  pivot_longer(-item_group, names_to = "metric", values_to = "pct") %>%
+  mutate(metric = recode(metric, "pct_orders" = "% of Orders", "pct_revenue" = "% of Revenue")) %>%
+  ggplot(aes(x = item_group, y = pct, fill = metric)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = paste0(pct, "%")),
+            position = position_dodge(width = 0.7), vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = c("% of Orders" = "#2C5F8A", "% of Revenue" = "#E8894A")) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Order Complexity: Items per Order",
+       subtitle = "Multi-item orders correlate with larger project spending",
+       x = "", y = "", fill = "") +
+  theme_buyer
+```
+
+```{r multi-item-table}
+item_tbl <- item_summary %>%
+  transmute(
+    `Items per Order` = item_group,
+    Orders = comma(orders),
+    `% of Orders` = paste0(pct_orders, "%"),
+    Revenue = dollar(revenue),
+    `% of Revenue` = paste0(pct_revenue, "%"),
+    `Avg Order Size` = dollar(avg_order)
+  )
+kable(item_tbl, align = "lrrrrr")
+```
+
+# Geographic Analysis
+
+```{r geo-data}
+# Use shipping state from BC orders
+geo_summary <- order_detail %>%
+  mutate(state = toupper(trimws(`Shipping State Abbreviation`))) %>%
+  filter(!is.na(state) & state != "" & nchar(state) == 2) %>%
+  group_by(state) %>%
+  summarise(
+    orders = n(),
+    revenue = sum(order_total, na.rm = TRUE),
+    customers = n_distinct(match_email, na.rm = TRUE),
+    avg_order = mean(order_total, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(revenue)) %>%
+  mutate(
+    pct_revenue = round(revenue / sum(revenue) * 100, 1),
+    cum_rev_pct = cumsum(pct_revenue),
+    rank = row_number()
+  )
+
+n_states <- nrow(geo_summary)
+top5_rev_pct <- sum(geo_summary$pct_revenue[1:min(5, n_states)])
+top10_rev_pct <- sum(geo_summary$pct_revenue[1:min(10, n_states)])
+```
+
+## Top Markets by Revenue
+
+```{r geo-top-markets, fig.height=6}
+geo_summary %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(state, revenue), y = revenue)) +
+  geom_col(fill = "#2C5F8A", width = 0.7) +
+  geom_text(aes(label = paste0(dollar(revenue, accuracy = 1, scale = 1e-3, suffix = "K"),
+                                " (", pct_revenue, "%)")),
+            hjust = -0.05, size = 3.5) +
+  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.3))) +
+  coord_flip() +
+  labs(title = "Top 20 Markets by Revenue",
+       subtitle = paste0("Top 5 states = ", round(top5_rev_pct, 1), "% of revenue | ",
+                         "Top 10 = ", round(top10_rev_pct, 1), "%"),
+       x = "", y = "Revenue") +
+  theme_buyer
+```
+
+## Geographic Mix by Customer Type
+
+```{r geo-by-type, fig.height=6}
+geo_by_type <- order_detail %>%
+  mutate(state = toupper(trimws(`Shipping State Abbreviation`))) %>%
+  filter(!is.na(state) & state != "" & nchar(state) == 2) %>%
+  group_by(state, broad_class) %>%
+  summarise(revenue = sum(order_total, na.rm = TRUE), .groups = "drop") %>%
+  group_by(state) %>%
+  mutate(total_rev = sum(revenue)) %>%
+  ungroup() %>%
+  filter(state %in% geo_summary$state[1:15])
+
+geo_by_type %>%
+  ggplot(aes(x = reorder(state, total_rev), y = revenue, fill = broad_class)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = colors_class) +
+  scale_y_continuous(labels = dollar) +
+  coord_flip() +
+  labs(title = "Top 15 Markets: Professional vs. Residential Mix",
+       x = "", y = "Revenue", fill = "Customer Type") +
+  theme_buyer
+```
+
+## Geographic Concentration
+
+```{r geo-concentration, fig.height=5}
+geo_summary %>%
+  ggplot(aes(x = rank, y = cum_rev_pct)) +
+  geom_line(color = "#2C5F8A", linewidth = 1.2) +
+  geom_point(data = geo_summary %>% filter(rank <= 10), color = "#E8894A", size = 2.5) +
+  geom_text(data = geo_summary %>% filter(rank <= 10),
+            aes(label = state), vjust = -1, size = 3.5, fontface = "bold") +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "gray50") +
+  annotate("text", x = n_states * 0.7, y = 82, label = "80% of revenue", color = "gray40", size = 4) +
+  scale_x_continuous(breaks = seq(0, n_states, 5)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 105)) +
+  labs(title = "Geographic Revenue Concentration",
+       subtitle = paste0("Revenue comes from ", n_states, " states — ",
+                         "top 10 account for ", round(top10_rev_pct, 1), "%"),
+       x = "Number of States (ranked by revenue)", y = "Cumulative % of Revenue") +
+  theme_buyer
+```
+
+```{r geo-table}
+geo_tbl <- geo_summary %>%
+  head(15) %>%
+  transmute(
+    Rank = rank, State = state,
+    Orders = comma(orders), Customers = comma(customers),
+    Revenue = dollar(revenue), `% of Rev` = paste0(pct_revenue, "%"),
+    `Cum Rev %` = paste0(cum_rev_pct, "%"),
+    `Avg Order` = dollar(avg_order)
+  )
+kable(geo_tbl, align = "rlrrrrrr")
+```
+
+> The business has **nationwide reach** across `r n_states` states with manageable concentration — no single state dominates dangerously. This geographic diversification reduces risk and provides multiple growth vectors.
+
+# Revenue Quality
+
+```{r revenue-quality}
+# Net revenue from Stripe (refunds)
+total_gross <- sum(customer_master$total_spend, na.rm = TRUE)
+total_refunds <- sum(customer_master$total_refunded, na.rm = TRUE)
+total_net <- total_gross - total_refunds
+refund_rate <- round(total_refunds / total_gross * 100, 2)
+
+# By customer type
+rev_quality <- customer_master %>%
+  group_by(broad_class) %>%
+  summarise(
+    gross_revenue = sum(total_spend, na.rm = TRUE),
+    refunds = sum(total_refunded, na.rm = TRUE),
+    net_revenue = gross_revenue - refunds,
+    refund_rate = round(refunds / gross_revenue * 100, 2),
+    .groups = "drop"
+  )
+```
+
+## Refund & Net Revenue Analysis
+
+```{r rev-quality-table}
+rq_tbl <- rev_quality %>%
+  transmute(
+    Type = broad_class,
+    `Gross Revenue` = dollar(gross_revenue),
+    Refunds = dollar(refunds),
+    `Net Revenue` = dollar(net_revenue),
+    `Refund Rate` = paste0(refund_rate, "%")
+  )
+
+overall_rq <- tibble(
+  Type = "**Overall**",
+  `Gross Revenue` = dollar(total_gross),
+  Refunds = dollar(total_refunds),
+  `Net Revenue` = dollar(total_net),
+  `Refund Rate` = paste0(refund_rate, "%")
+)
+
+kable(bind_rows(rq_tbl, overall_rq), align = "lrrrr")
+```
+
+> A `r refund_rate`% refund rate indicates strong product quality, accurate order fulfillment, and effective customer support. This is well within industry norms for custom and semi-custom building products.
+
+## Monthly Revenue Trajectory
+
+```{r revenue-trajectory, fig.height=5}
+monthly_rev_enhanced <- customer_cohorts %>%
+  group_by(order_month) %>%
+  summarise(
+    gross_revenue = sum(order_total, na.rm = TRUE),
+    orders = n(),
+    new_customers = n_distinct(match_email[order_num == 1], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    trailing_3mo = zoo::rollmean(gross_revenue, k = 3, fill = NA, align = "right"),
+    trailing_6mo = zoo::rollmean(gross_revenue, k = 6, fill = NA, align = "right")
+  )
+
+monthly_rev_enhanced %>%
+  ggplot(aes(x = order_month)) +
+  geom_col(aes(y = gross_revenue), fill = "#2C5F8A", alpha = 0.3, width = 25) +
+  geom_line(aes(y = trailing_3mo, color = "3-Month Avg"), linewidth = 1) +
+  geom_line(aes(y = trailing_6mo, color = "6-Month Avg"), linewidth = 1.2) +
+  scale_color_manual(values = c("3-Month Avg" = "#E8894A", "6-Month Avg" = "#2C5F8A")) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "3 months") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Revenue Trajectory with Moving Averages",
+       subtitle = "Smoothed trend lines filter seasonal noise",
+       x = "", y = "Revenue", color = "") +
+  theme_buyer + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Professional Segment Deep Dive
+
+```{r pro-subsegments, fig.height=6}
+# Professional sub-segments from Zoho business type
+pro_subseg <- customer_master %>%
+  filter(broad_class == "Professional") %>%
+  left_join(zoho_classified %>%
+    filter(!is.na(zoho_email) & zoho_email != "") %>%
+    group_by(zoho_email) %>% slice(1) %>% ungroup() %>%
+    select(zoho_email, zoho_business_type),
+    by = c("stripe_email" = "zoho_email")) %>%
+  mutate(
+    subsegment = case_when(
+      !is.na(zoho_business_type) & zoho_business_type != "" ~ str_to_title(zoho_business_type),
+      TRUE ~ "Other / Unspecified"
+    )
+  )
+
+pro_subseg_summary <- pro_subseg %>%
+  group_by(subsegment) %>%
+  summarise(
+    customers = n(),
+    revenue = sum(total_spend, na.rm = TRUE),
+    avg_ltv = mean(total_spend, na.rm = TRUE),
+    repeat_rate = round(mean(is_repeat) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(revenue)) %>%
+  head(10)
+
+pro_subseg_summary %>%
+  ggplot(aes(x = reorder(subsegment, revenue), y = revenue)) +
+  geom_col(fill = "#2C5F8A", width = 0.7) +
+  geom_text(aes(label = paste0(dollar(revenue, accuracy = 1, scale = 1e-3, suffix = "K"),
+                                " | ", customers, " customers")),
+            hjust = -0.05, size = 3.5) +
+  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.35))) +
+  coord_flip() +
+  labs(title = "Professional Sub-Segments by Revenue",
+       subtitle = "Top 10 professional categories",
+       x = "", y = "Revenue") +
+  theme_buyer
+```
+
+```{r pro-subseg-table}
+pro_sub_tbl <- pro_subseg_summary %>%
+  transmute(
+    Segment = subsegment,
+    Customers = comma(customers),
+    Revenue = dollar(revenue),
+    `Avg LTV` = dollar(avg_ltv),
+    `Repeat Rate` = paste0(repeat_rate, "%")
+  )
+kable(pro_sub_tbl, align = "lrrrr")
+```
+
+## Top Professional Accounts
+
+```{r top-accounts, fig.height=6}
+top_pros <- customer_master %>%
+  filter(broad_class == "Professional") %>%
+  arrange(desc(total_spend)) %>%
+  head(25) %>%
+  mutate(
+    display_name = paste0("Account #", row_number()),
+    label = paste0(dollar(total_spend), " | ", total_orders, " orders")
+  )
+
+top_pros %>%
+  ggplot(aes(x = reorder(display_name, total_spend), y = total_spend)) +
+  geom_col(fill = "#2C5F8A", width = 0.7) +
+  geom_text(aes(label = label), hjust = -0.05, size = 3) +
+  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.3))) +
+  coord_flip() +
+  labs(title = "Top 25 Professional Accounts by Lifetime Value",
+       subtitle = "Anonymized — demonstrates depth of professional relationships",
+       x = "", y = "Lifetime Revenue") +
+  theme_buyer
+```
+
+```{r top-accounts-summary}
+top25_rev <- sum(top_pros$total_spend)
+top25_pct <- round(top25_rev / sum(customer_master$total_spend[customer_master$broad_class == "Professional"]) * 100, 1)
+```
+
+> The top 25 professional accounts represent **`r dollar(top25_rev)`** in lifetime revenue (**`r top25_pct`%** of professional revenue). These are deeply embedded relationships with high switching costs — exactly the type of recurring professional demand that Eagle Woodworking can scale with additional capacity.
+
+## Trade Program Conversion
+
+```{r trade-conversion}
+# Customers who showed trade interest vs. became active buyers
+trade_interested <- zoho_classified %>%
+  filter(sig_trade_interest | sig_trade_interest_meta | sig_trade_program) %>%
+  filter(!is.na(zoho_email) & zoho_email != "") %>%
+  distinct(zoho_email)
+
+trade_purchased <- customer_master %>%
+  filter(stripe_email %in% trade_interested$zoho_email)
+
+trade_conv_rate <- round(nrow(trade_purchased) / nrow(trade_interested) * 100, 1)
+trade_rev <- sum(trade_purchased$total_spend, na.rm = TRUE)
+trade_avg_ltv <- mean(trade_purchased$total_spend, na.rm = TRUE)
+```
+
+```{r trade-table}
+trade_tbl <- tibble(
+  Metric = c("CRM contacts with trade program interest",
+             "Converted to paying customer",
+             "Conversion rate",
+             "Revenue from converted trade contacts",
+             "Avg LTV of trade program customers"),
+  Value = c(comma(nrow(trade_interested)),
+            comma(nrow(trade_purchased)),
+            paste0(trade_conv_rate, "%"),
+            dollar(trade_rev),
+            dollar(trade_avg_ltv))
+)
+kable(trade_tbl, align = "lr")
+```
+
+> The trade program pipeline contains **`r comma(nrow(trade_interested))`** contacts who expressed interest. At a `r trade_conv_rate`% conversion rate, there is significant headroom to convert more professionals through targeted outreach — a low-cost growth lever for an acquirer with existing trade relationships.
 
 # Methodology
 
